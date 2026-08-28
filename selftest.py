@@ -282,6 +282,8 @@ def test_orderflow(zone) -> Tuple[bool, ArmedContext]:
     ctx.candles[SETTINGS.ltf_slow] = build_ltf(zone, 5 * 60_000, 90)
     ctx.armed_at = time.time() - 600
     ctx.seeded = True
+    ctx.last_event_ts = time.time()      # the fixture stands in for a live feed
+    ctx.last_flow_ts = time.time()
 
     health = ctx.book.health(SETTINGS.min_trades_for_flow)
     check("footprint populated", health["enough"],
@@ -332,6 +334,14 @@ def test_decision(ctx: ArmedContext) -> Tuple[bool, object]:
     blocked = evaluate(ctx, SETTINGS, trend_state="strong_down")
     check("counter-trend setup rejected", not blocked.passed and
           "against_4h_trend" in blocked.blockers)
+
+    # a frozen feed must never produce a signal, however good the data looks
+    fresh_ts = ctx.last_flow_ts
+    ctx.last_flow_ts = time.time() - (SETTINGS.max_flow_age_sec + 60)
+    stale = evaluate(ctx, SETTINGS, trend_state="range")
+    check("stale order-flow feed rejected", not stale.passed and
+          any(b.startswith("stale_flow") for b in stale.blockers), str(stale.blockers))
+    ctx.last_flow_ts = fresh_ts
     return ok, signal
 
 
@@ -385,6 +395,82 @@ async def _test_db(signal) -> bool:
     return ok
 
 
+async def _test_resilience(zone) -> bool:
+    """
+    Regressions for the failure modes that silently killed a live deployment:
+    a latched rate limiter, a websocket that connects and then says nothing,
+    and a command handler that blocks the Telegram poll loop.
+    """
+    from core.rate_limiter import WeightLimiter
+    from notifier.telegram import TelegramBot
+
+    # 1. the exchange's reported weight must decay, not latch forever
+    lim = WeightLimiter(1100)
+    lim.sync_from_header(1097)
+    fresh_reading = lim.reported
+    lim._reported_at -= 61                       # the same reading, a minute old
+    started = time.time()
+    await asyncio.wait_for(lim.acquire(10), timeout=3)
+    ok = check("stale weight reading decays instead of deadlocking",
+               fresh_reading > 1000 and lim.reported == 0 and (time.time() - started) < 1,
+               f"fresh {fresh_reading} -> aged {lim.reported}")
+
+    # 2. a fresh reading must still hold the budget closed
+    lim2 = WeightLimiter(1100)
+    lim2.sync_from_header(1097)
+    blocked = False
+    try:
+        await asyncio.wait_for(lim2.acquire(50), timeout=1.5)
+    except asyncio.TimeoutError:
+        blocked = True
+    ok &= check("fresh weight reading still enforces the budget", blocked)
+
+    # 3. a silent socket must be detected rather than treated as healthy
+    from core.ws import MarkPriceStream
+    st = MarkPriceStream("wss://example.invalid", idle_timeout=2)
+    ok &= check("mark price stream reports never-received honestly",
+                st.stale_for == float("inf") and not st.healthy
+                and st.describe_staleness() == "no data since connect")
+    ok &= check("mark price stream has fallback endpoints", len(st.urls) >= 2,
+                f"{len(st.urls)} endpoints")
+
+    # 4. REST fallback must revive a context whose websocket died
+    ctx = ArmedContext("TESTUSDT", zone, SETTINGS, tick_size=0.01, decimals=2,
+                       ref_price=zone.mid)
+    ctx.last_flow_ts = time.time() - 900
+    stale_before = ctx.flow_age
+
+    class _StubREST:
+        async def agg_trades(self, s, l):
+            return build_agg_trades(zone, 1_700_003_600_000)
+        async def klines(self, s, i, l):
+            return build_ltf(zone, 60_000, 120)
+        async def depth(self, s, l):
+            return {"bids": [["1", "5"]], "asks": [["2", "5"]]}
+
+    await ctx.poll_rest(_StubREST())
+    ok &= check("REST fallback revives a dead order-flow feed",
+                stale_before > 800 and ctx.flow_age < 5 and ctx.book.total_trades > 0,
+                f"flow age {stale_before:.0f}s -> {ctx.flow_age:.1f}s, "
+                f"{ctx.book.total_trades} trades")
+
+    # 5. a blocking command must not wedge the poll loop
+    bot = TelegramBot("token", "1", command_timeout=1)
+    delivered = []
+
+    async def _never_returns(cmd, args):
+        await asyncio.sleep(30)
+
+    async def _capture(text, **kw):
+        delivered.append(text)
+
+    bot.send = _capture
+    await asyncio.wait_for(bot._dispatch(_never_returns, "status", []), timeout=5)
+    ok &= check("hung command times out instead of silencing the bot",
+                bool(delivered) and "timed out" in delivered[0])
+    return ok
+
+
 def test_formatting(signal) -> bool:
     from notifier import formatter as fmt
     msg = fmt.signal_message(signal, 1, " · fresh")
@@ -425,6 +511,9 @@ def run_selftest() -> bool:
 
     print("\n\033[1m7. Telegram rendering\033[0m")
     test_formatting(signal)
+
+    print("\n\033[1m8. Resilience (rate limiter, dead feeds, hung commands)\033[0m")
+    asyncio.run(_test_resilience(zone))
 
     return _summary()
 

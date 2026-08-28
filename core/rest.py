@@ -106,6 +106,11 @@ class BinanceREST:
     async def mark_prices(self) -> List[dict]:
         return await self._get("/fapi/v1/premiumIndex", weight=10)
 
+    async def ticker_prices(self) -> List[dict]:
+        """Every symbol's last price for weight 2 - the cheap fallback when
+        the mark price stream is unavailable."""
+        return await self._get("/fapi/v1/ticker/price", weight=2)
+
     async def klines(self, symbol: str, interval: str, limit: int = 500,
                      end_time: Optional[int] = None) -> List[Candle]:
         params: Dict[str, Any] = {"symbol": symbol, "interval": interval, "limit": limit}

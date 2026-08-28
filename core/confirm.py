@@ -61,8 +61,14 @@ def evaluate(ctx, cfg, trend_state: str = "range") -> Decision:
     # ------------------------------------------------------------- data gates
     health = book.health(cfg.min_trades_for_flow)
     d.details["flow"] = health
+    d.details["flow_age"] = round(ctx.flow_age)
+    d.details["feed_age"] = round(ctx.feed_age)
     if not health["enough"]:
         d.block("thin_flow")
+    if not ctx.flow_fresh(cfg.max_flow_age_sec):
+        # never judge live order flow from a frozen feed - a silent socket
+        # would otherwise keep re-scoring the same seed data indefinitely
+        d.block(f"stale_flow({int(ctx.flow_age)}s)")
     if len(fast) < 30 or len(slow) < 30 or len(micro) < 40:
         d.block("insufficient_candles")
     if d.blockers:

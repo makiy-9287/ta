@@ -36,10 +36,12 @@ COMMANDS = [
 
 
 class TelegramBot:
-    def __init__(self, token: str, chat_id: str, poll_timeout: int = 25):
+    def __init__(self, token: str, chat_id: str, poll_timeout: int = 25,
+                 command_timeout: int = 45):
         self.token = token
         self.chat_id = str(chat_id)
         self.poll_timeout = poll_timeout
+        self.command_timeout = command_timeout
         self.base = f"https://api.telegram.org/bot{token}"
         self._session: Optional[aiohttp.ClientSession] = None
         self._offset = 0
@@ -136,18 +138,35 @@ class TelegramBot:
                     parts = text.split()
                     cmd = parts[0][1:].split("@")[0].lower()
                     args = parts[1:]
-                    try:
-                        reply = await handler(cmd, args)
-                    except Exception as exc:  # noqa: BLE001
-                        log.exception("command /%s failed", cmd)
-                        reply = f"⚠️ <code>/{cmd}</code> failed: {exc}"
-                    if reply:
-                        await self.send(reply)
+                    # Run each command in its own task. If a handler blocks -
+                    # on a rate limiter, a hung REST call, anything - polling
+                    # must keep running or the bot goes permanently silent.
+                    asyncio.create_task(self._dispatch(handler, cmd, args))
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001
                 log.warning("polling error: %s", exc)
                 await asyncio.sleep(3.0)
+
+
+    async def _dispatch(self, handler: CommandHandler, cmd: str, args: List[str]) -> None:
+        try:
+            reply = await asyncio.wait_for(handler(cmd, args), timeout=self.command_timeout)
+        except asyncio.TimeoutError:
+            log.warning("command /%s timed out after %ss", cmd, self.command_timeout)
+            reply = (f"⏳ <code>/{cmd}</code> timed out after {self.command_timeout}s.\n"
+                     f"The engine is busy or an upstream call is stalling - "
+                     f"try <code>/health</code>.")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            log.exception("command /%s failed", cmd)
+            reply = f"⚠️ <code>/{cmd}</code> failed: {exc}"
+        if reply:
+            try:
+                await self.send(reply)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("could not deliver reply to /%s: %s", cmd, exc)
 
 
 def _split(text: str) -> List[str]:

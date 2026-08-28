@@ -63,6 +63,15 @@ class TradeMonitor:
             except Exception as exc:  # noqa: BLE001
                 log.exception("monitor error on %s: %s", trade["symbol"], exc)
 
+    async def _notify_safe(self, trade: dict, kind: str, info: dict) -> None:
+        """Alert delivery must never break the trade lifecycle - a Telegram
+        outage cannot be allowed to strand a setup or keep its symbol out of
+        the hunting pool."""
+        try:
+            await self.notify(trade, kind, info)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("could not deliver %s alert for %s: %s", kind, trade["symbol"], exc)
+
     async def _evaluate(self, trade: dict, price: float) -> None:
         tid = trade["id"]
         long_ = trade["direction"] == "LONG"
@@ -123,8 +132,8 @@ class TradeMonitor:
             trade["status"] = f"TP{n}"
             await self.db.update_signal(tid, **updates)
             await self.db.add_event(tid, f"TP{n}", price, "")
-            await self.notify(trade, f"TP{n}", {"price": price, "r": r_now,
-                                                "new_stop": trade.get("sl_current")})
+            await self._notify_safe(trade, f"TP{n}", {"price": price, "r": r_now,
+                                                      "new_stop": trade.get("sl_current")})
             log.info("%s #%d hit TP%d at %s", trade["symbol"], tid, n, fmt_price(price, trade["decimals"]))
             break
 
@@ -145,10 +154,13 @@ class TradeMonitor:
         await self.db.add_event(tid, status, price, reason)
         self.active.pop(tid, None)
         trade.update(status=status, close_price=price, close_reason=reason, result_r=r, result_pct=pct)
-        await self.notify(trade, status, {"price": price, "r": r, "pct": pct, "reason": reason})
+        await self._notify_safe(trade, status, {"price": price, "r": r, "pct": pct, "reason": reason})
         log.info("%s #%d closed %s (%.2fR)", trade["symbol"], tid, status, r)
         if self.on_release:
-            await self.on_release(trade["symbol"])
+            try:
+                await self.on_release(trade["symbol"])
+            except Exception as exc:  # noqa: BLE001
+                log.warning("release hook failed for %s: %s", trade["symbol"], exc)
 
     async def force_close(self, signal_id: int, price: float, reason: str = "Manual close") -> bool:
         trade = self.active.get(signal_id)

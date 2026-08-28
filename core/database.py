@@ -207,6 +207,14 @@ class Database:
             ",".join("?" * len(CLOSED)), (symbol,) + tuple(CLOSED))
         return bool(rows)
 
+    async def last_signal_map(self) -> Dict[str, int]:
+        """Most recent activity per symbol, in one query - used to restore
+        re-arm cooldowns after a restart without hitting the database once
+        per symbol on every proximity scan."""
+        rows = await self.query(
+            "SELECT symbol, MAX(COALESCE(closed_ts, created_ts)) AS t FROM signals GROUP BY symbol")
+        return {r["symbol"]: int(r["t"] or 0) for r in rows}
+
     async def last_signal_ts(self, symbol: str) -> int:
         rows = await self.query(
             "SELECT MAX(COALESCE(closed_ts, created_ts)) AS t FROM signals WHERE symbol=?", (symbol,))

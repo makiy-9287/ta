@@ -87,6 +87,8 @@ nohup ./venv/bin/python main.py >> data/stdout.log 2>&1 &
 | `rate limited` in logs | lower `WEIGHT_BUDGET_PER_MIN`; a shared/NAT IP counts against you |
 | Telegram silent | `journalctl` for `telegram` errors; confirm chat id (negative for groups) |
 | Memory climbing | `/health` shows RSS; report it with `MAX_ARMED_SYMBOLS` and uptime |
+| `mark price stream unhealthy` / `no data since connect` | the host is not receiving websocket data — `/health` will show `Price source: rest`. The engine keeps working on REST polling; if you want full-resolution flow, move to a host that can reach `fstream.binance.com` |
+| Commands silent but logs healthy | fixed in 1.0.1 — a latched weight limiter used to block the handler. Confirm with `/health`: `waits` should not climb |
 
 Region note: Binance blocks some IP ranges. If REST calls fail immediately on a
 fresh VPS, the host's region is the first thing to check.

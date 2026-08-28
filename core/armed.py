@@ -34,6 +34,11 @@ class ArmedContext:
         self.last_price = ref_price
         self.last_blockers: List[str] = []
         self.seeded = False
+        self.last_event_ts = 0.0        # last live WS payload
+        self.last_flow_ts = 0.0         # last time flow data advanced (WS or REST)
+        self.rest_polls = 0
+        self._last_agg_id = 0
+        self._last_trade_ts = 0
 
         self.book = FootprintBook(
             tick_size=tick_size, ref_price=ref_price,
@@ -64,6 +69,8 @@ class ArmedContext:
         try:
             trades = await rest.agg_trades(self.symbol, 1000)
             self.book.seed_from_rest(trades)
+            if trades:
+                self._remember_trade(trades[-1])
         except Exception as exc:  # noqa: BLE001
             log.warning("%s seed aggTrades failed: %s", self.symbol, exc)
 
@@ -74,12 +81,14 @@ class ArmedContext:
             log.debug("%s seed depth failed: %s", self.symbol, exc)
 
         self.seeded = True
+        self.last_flow_ts = time.time()
         log.info("armed %s %s zone %.6f-%.6f score=%d (seeded %d trades)",
                  self.symbol, self.direction, self.zone.low, self.zone.high,
                  self.zone.score, self.book.total_trades)
 
     # -------------------------------------------------------------- ws ingest
     async def on_event(self, event: str, data: dict) -> None:
+        self.last_event_ts = time.time()
         if event == "aggTrade":
             self.book.add(
                 price=safe_float(data.get("p")),
@@ -88,6 +97,7 @@ class ArmedContext:
                 ts=int(data.get("T") or data.get("E") or now_ms()),
             )
             self.last_price = safe_float(data.get("p"), self.last_price)
+            self.last_flow_ts = time.time()
         elif event == "depthUpdate" or ("b" in data and "a" in data and "e" not in data):
             self.depth.update(data.get("b", []), data.get("a", []),
                               int(data.get("T") or data.get("E") or now_ms()))
@@ -107,7 +117,79 @@ class ArmedContext:
             if len(series) > limit + 30:
                 del series[: len(series) - limit]
 
+    # --------------------------------------------------------- rest fallback
+    def _is_new_trade(self, t: dict) -> bool:
+        """Prefer the aggregate-trade id, fall back to the timestamp when the
+        payload has no id (defensive: never re-ingest the same prints twice,
+        and never mistake a quiet tape for a dead feed)."""
+        tid = int(safe_float(t.get("a"), 0))
+        if tid and self._last_agg_id:
+            return tid > self._last_agg_id
+        if tid and not self._last_agg_id:
+            return True
+        return int(safe_float(t.get("T"), 0)) > self._last_trade_ts
+
+    def _remember_trade(self, t: dict) -> None:
+        self._last_agg_id = max(self._last_agg_id, int(safe_float(t.get("a"), 0)))
+        self._last_trade_ts = max(self._last_trade_ts, int(safe_float(t.get("T"), 0)))
+
+    async def poll_rest(self, rest) -> bool:
+        """
+        Refresh order flow over REST when the WebSocket feed is silent.
+
+        Some networks (and some cloud regions) accept the WS handshake and then
+        deliver nothing. Without this the engine would keep evaluating frozen
+        seed data and could fire a signal built on order flow an hour old.
+        """
+        ok = False
+        try:
+            trades = await rest.agg_trades(self.symbol, 1000)
+            new = [t for t in trades if self._is_new_trade(t)]
+            if new:
+                self.book.seed_from_rest(new)
+                self._remember_trade(new[-1])
+                self.last_price = safe_float(new[-1].get("p"), self.last_price)
+                ok = True
+            # a successful poll means our view of the market is current, even
+            # if the tape was quiet - otherwise a slow symbol looks "dead" and
+            # gets disarmed by the staleness guard while nothing is wrong
+            self.last_flow_ts = time.time()
+        except Exception as exc:  # noqa: BLE001
+            log.debug("%s aggTrade poll failed: %s", self.symbol, exc)
+
+        for interval in list(self.candles.keys()):
+            try:
+                fresh = await rest.klines(self.symbol, interval, 100)
+                for c in fresh[-3:]:
+                    self._upsert(interval, c)
+            except Exception as exc:  # noqa: BLE001
+                log.debug("%s kline poll %s failed: %s", self.symbol, interval, exc)
+
+        try:
+            snap = await rest.depth(self.symbol, 20)
+            self.depth.update(snap.get("bids", []), snap.get("asks", []), now_ms())
+        except Exception as exc:  # noqa: BLE001
+            log.debug("%s depth poll failed: %s", self.symbol, exc)
+
+        self.rest_polls += 1
+        return ok
+
     # ----------------------------------------------------------------- status
+    @property
+    def feed_age(self) -> float:
+        """Seconds since the live WebSocket last delivered anything."""
+        return (time.time() - self.last_event_ts) if self.last_event_ts else \
+            (time.time() - self.armed_at)
+
+    @property
+    def flow_age(self) -> float:
+        """Seconds since order-flow data last advanced, by any transport."""
+        return (time.time() - self.last_flow_ts) if self.last_flow_ts else \
+            (time.time() - self.armed_at)
+
+    def flow_fresh(self, max_age: float) -> bool:
+        return self.flow_age <= max_age
+
     @property
     def price(self) -> float:
         micro = self.candles.get(self.cfg.micro_interval) or []
@@ -158,6 +240,9 @@ class ArmedContext:
             "age_min": round(self.age_min, 1),
             "trades": h["trades"],
             "depth_updates": self.depth.updates,
+            "feed_age": round(self.feed_age),
+            "flow_age": round(self.flow_age),
+            "rest_polls": self.rest_polls,
             "evaluations": self.evaluations,
             "blockers": self.last_blockers[:4],
         }

@@ -151,6 +151,18 @@ class Settings:
     housekeeping_minutes: int = field(default_factory=lambda: _i("HOUSEKEEPING_MINUTES", 15))
     startup_notice: bool = field(default_factory=lambda: _b("STARTUP_NOTICE", True))
 
+    # ------------------------------------------------ resilience / transport
+    # Some networks accept the WebSocket handshake and then deliver nothing at
+    # all. These control how fast that is detected and how the engine copes.
+    ws_idle_timeout_sec: int = field(default_factory=lambda: _i("WS_IDLE_TIMEOUT_SEC", 45))
+    ws_flow_idle_timeout_sec: int = field(default_factory=lambda: _i("WS_FLOW_IDLE_TIMEOUT_SEC", 120))
+    max_flow_age_sec: int = field(default_factory=lambda: _i("MAX_FLOW_AGE_SEC", 240))
+    rest_fallback: bool = field(default_factory=lambda: _b("REST_FALLBACK", True))
+    flow_poll_sec: int = field(default_factory=lambda: _i("FLOW_POLL_SEC", 20))
+    max_armed_fallback: int = field(default_factory=lambda: _i("MAX_ARMED_FALLBACK", 4))
+    price_cache_sec: float = field(default_factory=lambda: _f("PRICE_CACHE_SEC", 5.0))
+    command_timeout_sec: int = field(default_factory=lambda: _i("COMMAND_TIMEOUT_SEC", 45))
+
     # ------------------------------------------------------------------ helpers
     @property
     def blacklist_set(self) -> set:

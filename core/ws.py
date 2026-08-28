@@ -29,13 +29,18 @@ Handler = Callable[[str, dict], Awaitable[None]]
 
 
 class _BaseStream:
-    def __init__(self, url: str, name: str):
-        self.url = url
+    def __init__(self, url: str, name: str, idle_timeout: float = 60.0):
+        self.urls = [url] if isinstance(url, str) else list(url)
+        self.url = self.urls[0]
         self.name = name
+        self.idle_timeout = idle_timeout
         self._task: Optional[asyncio.Task] = None
         self._running = False
+        self._url_index = 0
         self.last_msg_ts = 0.0
+        self.messages = 0
         self.reconnects = 0
+        self.silent_drops = 0
 
     async def start(self) -> None:
         if self._task and not self._task.done():
@@ -59,7 +64,15 @@ class _BaseStream:
 
     @property
     def stale_for(self) -> float:
-        return time.time() - self.last_msg_ts if self.last_msg_ts else 1e9
+        """Seconds since the last payload. Never-received reports as inf."""
+        return (time.time() - self.last_msg_ts) if self.last_msg_ts else float("inf")
+
+    @property
+    def healthy(self) -> bool:
+        return self.alive and self.stale_for < max(self.idle_timeout, 30.0)
+
+    def describe_staleness(self) -> str:
+        return "no data since connect" if not self.last_msg_ts else f"{self.stale_for:.0f}s"
 
     async def _handle(self, payload: dict) -> None:  # pragma: no cover - overridden
         raise NotImplementedError
@@ -67,17 +80,28 @@ class _BaseStream:
     async def _run(self) -> None:
         backoff = 1.0
         while self._running:
+            self.url = self.urls[self._url_index % len(self.urls)]
+            got_data = False
             try:
                 async with websockets.connect(
                     self.url, ping_interval=20, ping_timeout=20,
                     close_timeout=5, max_queue=512,
                 ) as sock:
                     log.info("ws connected: %s", self.name)
-                    backoff = 1.0
-                    async for raw in sock:
-                        if not self._running:
-                            break
+                    while self._running:
+                        # A socket that opens, answers pings and never sends a
+                        # payload is indistinguishable from a healthy one at the
+                        # transport layer - some networks and middleboxes park
+                        # connections exactly like that. Treat silence as a
+                        # failure instead of waiting forever inside `async for`.
+                        try:
+                            raw = await asyncio.wait_for(sock.recv(), timeout=self.idle_timeout)
+                        except asyncio.TimeoutError:
+                            raise ConnectionError(
+                                f"no data for {self.idle_timeout:.0f}s") from None
+                        got_data = True
                         self.last_msg_ts = time.time()
+                        self.messages += 1
                         try:
                             payload = json.loads(raw)
                         except (ValueError, TypeError):
@@ -89,20 +113,44 @@ class _BaseStream:
                 if not self._running:
                     return
                 self.reconnects += 1
+                if not got_data:
+                    # this endpoint gave us nothing at all - try the next
+                    # variant next time round (if the stream defines any)
+                    self.silent_drops += 1
+                    self._url_index += 1
+                    if len(self.urls) > 1:
+                        log.warning("ws %s silent on %s - switching endpoint",
+                                    self.name, self.url.rsplit("/", 1)[-1][:48])
                 log.warning("ws %s dropped (%s) - reconnect in %.0fs", self.name, exc, backoff)
                 await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 30.0)
+                # once an endpoint has proven repeatedly silent, stop hammering
+                # it - the network is likely blocking us, and connection
+                # attempts are themselves rate limited by the exchange
+                ceiling = 120.0 if self.silent_drops >= 5 else 30.0
+                backoff = min(backoff * 2, ceiling)
 
 
 class MarkPriceStream(_BaseStream):
     """One connection, every symbol's mark price, updated once per second."""
 
-    def __init__(self, ws_base: str):
-        super().__init__(f"{ws_base}/ws/!markPrice@arr@1s", "markprice")
+    def __init__(self, ws_base: str, idle_timeout: float = 45.0):
+        # two endpoint spellings: the 1s variant and the default 3s one, plus
+        # the combined-stream form. If the network silently swallows one we
+        # rotate to the next rather than sitting on a dead socket.
+        super().__init__(
+            [
+                f"{ws_base}/ws/!markPrice@arr@1s",
+                f"{ws_base}/stream?streams=!markPrice@arr@1s",
+                f"{ws_base}/ws/!markPrice@arr",
+            ],
+            "markprice", idle_timeout=idle_timeout,
+        )
         self.prices: Dict[str, float] = {}
         self.updated_ts: float = 0.0
 
     async def _handle(self, payload) -> None:
+        if isinstance(payload, dict) and "data" in payload:
+            payload = payload["data"]          # combined-stream wrapper
         items = payload if isinstance(payload, list) else [payload]
         for it in items:
             sym = it.get("s")
@@ -125,16 +173,15 @@ class SymbolStream(_BaseStream):
 
     def __init__(self, ws_base: str, symbol: str, handler: Handler,
                  depth_levels: int = 20, depth_speed_ms: int = 500,
-                 intervals: Optional[List[str]] = None):
+                 intervals: Optional[List[str]] = None, idle_timeout: float = 90.0):
         self.symbol = symbol.upper()
         low = self.symbol.lower()
         intervals = intervals or ["1m", "3m", "5m"]
         parts = [f"{low}@aggTrade", f"{low}@depth{depth_levels}@{depth_speed_ms}ms"]
         parts += [f"{low}@kline_{iv}" for iv in intervals]
         url = f"{ws_base}/stream?streams=" + "/".join(parts)
-        super().__init__(url, f"flow:{self.symbol}")
+        super().__init__(url, f"flow:{self.symbol}", idle_timeout=idle_timeout)
         self.handler = handler
-        self.messages = 0
 
     async def _handle(self, payload: dict) -> None:
         data = payload.get("data") if "data" in payload else payload

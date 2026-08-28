@@ -243,26 +243,47 @@ def stats_message(engine: dict, armed: List[dict]) -> str:
     if armed:
         lines += ["", "<b>Currently armed</b>"]
         for a in armed:
+            feed = f" · feed {a['feed_age']}s" if a.get("feed_age", 0) > 60 else ""
+            polls = f" · {a['rest_polls']} REST polls" if a.get("rest_polls") else ""
             lines.append(
                 f"{esc(a['symbol'])} {a['direction']} · zone {a['score']} · "
-                f"{a['trades']} trades · {a['age_min']}m")
+                f"{a['trades']} trades · {a['age_min']}m{feed}{polls}")
             if a["blockers"]:
                 lines.append("   waiting on: " + esc(", ".join(a["blockers"])))
     return "\n".join(lines)
 
 
 def health_message(h: dict) -> str:
-    return "\n".join([
+    lines = [
         "🩺 <b>SYSTEM HEALTH</b>",
         f"Uptime <b>{h['uptime']}</b> · Memory <b>{h['rss_mb']:.0f} MB</b>",
         f"REST weight <b>{h['weight_used']}/{h['weight_budget']}</b> per minute "
         f"(exchange reports {h['weight_reported']})",
+    ]
+    if h.get("penalty_sec"):
+        lines.append(f"⚠️ Rate-limit penalty active for {h['penalty_sec']}s")
+
+    lines += [
         f"Mark-price stream {'🟢' if h['markprice_ok'] else '🔴'} "
-        f"({h['markprice_symbols']} symbols, {h['markprice_age']:.0f}s ago)",
-        f"Flow streams <b>{h['flow_streams']}</b> · reconnects <b>{h['reconnects']}</b>",
+        f"({h['markprice_symbols']} symbols, {esc(h['markprice_age'])})",
+        f"Price source <b>{esc(h['price_source'])}</b>"
+        + (f" · {h['rest_price_symbols']} symbols cached" if h['price_source'] == "rest" else ""),
+        f"Flow streams <b>{h['flow_streams']}</b> · reconnects <b>{h['reconnects']}</b>"
+        + (f" · <b>{h['silent_sockets']}</b> silent" if h.get("silent_sockets") else ""),
+    ]
+    if h.get("rest_polls"):
+        lines.append(f"REST flow polls <b>{h['rest_polls']}</b> (websocket feed degraded)")
+
+    lines += [
         f"Database <code>{esc(h['db_path'])}</code> · {h['db_size_mb']:.1f} MB",
         f"Tasks alive <b>{h['tasks']}</b> · Telegram messages sent <b>{h['tg_sent']}</b>",
-    ])
+    ]
+
+    if not h["markprice_ok"]:
+        lines += ["", "<i>The websocket feed is not delivering data. The engine "
+                      "is running on REST polling - signals still work, but flow "
+                      "resolution is coarser. Often a regional block on the host.</i>"]
+    return "\n".join(lines)
 
 
 def help_message() -> str:

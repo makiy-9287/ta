@@ -50,10 +50,11 @@ class SniperEngine:
         self.limiter = WeightLimiter(cfg.weight_budget)
         self.rest = BinanceREST(cfg.rest_base, self.limiter, cfg.rest_timeout)
         self.db = Database(cfg.db_path)
-        self.bot = TelegramBot(cfg.telegram_token, cfg.telegram_chat_id, cfg.telegram_poll_timeout)
+        self.bot = TelegramBot(cfg.telegram_token, cfg.telegram_chat_id,
+                               cfg.telegram_poll_timeout, cfg.command_timeout_sec)
         self.watchlist = WatchlistManager(self.rest, self.db, cfg)
         self.zone_engine = ZoneEngine(cfg)
-        self.mark = MarkPriceStream(cfg.ws_base)
+        self.mark = MarkPriceStream(cfg.ws_base, idle_timeout=cfg.ws_idle_timeout_sec)
         self.monitor = TradeMonitor(self.db, cfg, self._trade_event, self._release_symbol)
 
         self.zones: Dict[str, List[Zone]] = {}
@@ -62,6 +63,8 @@ class SniperEngine:
         self.streams: Dict[str, SymbolStream] = {}
         self.cooldown: Dict[str, float] = {}
         self.rest_prices: Dict[str, float] = {}
+        self._rest_price_ts = 0.0
+        self.price_source = "starting"
 
         self._arm_lock = asyncio.Lock()
         self._tasks: List[asyncio.Task] = []
@@ -93,11 +96,11 @@ class SniperEngine:
 
         self.signals_total = int(await self.db.get_meta("signals_total", 0) or 0)
         await self.monitor.load()
+        await self._restore_cooldowns()
         await self.mark.start()
 
         log.info("building initial watchlist...")
         await self.watchlist.refresh()
-        await self.mark.start()
         await self._rebuild_zones(initial=True)
 
         if self.cfg.startup_notice:
@@ -109,6 +112,7 @@ class SniperEngine:
             asyncio.create_task(self._loop_proximity(), name="proximity"),
             asyncio.create_task(self._loop_arm(), name="arm"),
             asyncio.create_task(self._loop_monitor(), name="monitor"),
+            asyncio.create_task(self._loop_flow_fallback(), name="flow-fallback"),
             asyncio.create_task(self._loop_housekeeping(), name="housekeeping"),
             asyncio.create_task(self.bot.poll(self.handle_command), name="telegram"),
         ]
@@ -134,6 +138,26 @@ class SniperEngine:
         log.info("shutdown complete")
 
     # ================================================================== loops
+    async def _restore_cooldowns(self) -> None:
+        """In-memory cooldowns die with the process. Without this a symbol
+        whose setup closed moments before a restart could be re-armed
+        instantly, producing a duplicate signal on the same move."""
+        try:
+            recent = await self.db.last_signal_map()
+        except Exception as exc:  # noqa: BLE001
+            log.debug("could not restore cooldowns: %s", exc)
+            return
+        window = self.cfg.rearm_cooldown_minutes * 60
+        now = time.time()
+        restored = 0
+        for symbol, ts in recent.items():
+            until = ts / 1000.0 + window
+            if until > now:
+                self.cooldown[symbol] = until
+                restored += 1
+        if restored:
+            log.info("restored re-arm cooldowns for %d symbols", restored)
+
     async def _loop_watchlist(self) -> None:
         while not self._stop.is_set():
             try:
@@ -212,7 +236,10 @@ class SniperEngine:
                 log.info("housekeeping: %.0f MB rss, %d objects freed, armed=%d, weight=%s",
                          rss_mb(), freed, len(self.armed), self.limiter.snapshot())
                 if not self.mark.alive or self.mark.stale_for > 120:
-                    log.warning("mark price stream stale (%.0fs) - restarting", self.mark.stale_for)
+                    log.warning("mark price stream unhealthy (%s, %d reconnects, %d silent) "
+                                "- restarting; prices are coming from %s",
+                                self.mark.describe_staleness(), self.mark.reconnects,
+                                self.mark.silent_drops, self.price_source)
                     await self.mark.stop()
                     await self.mark.start()
             except asyncio.CancelledError:
@@ -267,11 +294,31 @@ class SniperEngine:
 
     # ============================================================== proximity
     async def _prices(self) -> Dict[str, float]:
+        """
+        Live prices, preferring the all-market stream and falling back to a
+        cached REST poll. Must never block for long: the Telegram command
+        handler and the trade monitor both depend on it.
+        """
         if self.mark.prices and self.mark.stale_for < 30:
+            self.price_source = "websocket"
             return self.mark.prices
+
+        now = time.time()
+        if self.rest_prices and (now - self._rest_price_ts) < self.cfg.price_cache_sec:
+            return self.rest_prices
         try:
-            data = await self.rest.mark_prices()
-            self.rest_prices = {d["symbol"]: float(d["markPrice"]) for d in data if d.get("markPrice")}
+            # ticker/price costs weight 2 for every symbol; premiumIndex is 10
+            data = await asyncio.wait_for(self.rest.ticker_prices(), timeout=20)
+            prices = {d["symbol"]: float(d["price"]) for d in data if d.get("price")}
+            if prices:
+                self.rest_prices = prices
+                self._rest_price_ts = now
+                if self.price_source != "rest":
+                    log.warning("mark price stream unavailable (%s) - using REST prices",
+                                self.mark.describe_staleness())
+                self.price_source = "rest"
+        except asyncio.TimeoutError:
+            log.warning("REST price fallback timed out")
         except Exception as exc:  # noqa: BLE001
             log.debug("rest price fallback failed: %s", exc)
         return self.rest_prices
@@ -302,7 +349,7 @@ class SniperEngine:
             log.info("proximity scan: %d symbols inside a graded zone", len(candidates))
 
         for _, symbol, zone, price in candidates:
-            if len(self.armed) >= self.cfg.max_armed_symbols:
+            if len(self.armed) >= self._armed_capacity():
                 break
             if self.monitor.count >= self.cfg.max_active_trades:
                 break
@@ -319,17 +366,37 @@ class SniperEngine:
             self.armed[symbol] = ctx
         try:
             await ctx.seed(self.rest)
+            if not self._ws_usable():
+                # the transport is demonstrably blocked - skip the socket and
+                # let the REST fallback loop feed this context instead
+                log.info("armed %s without a websocket (transport degraded, "
+                         "using REST flow polling)", symbol)
+                return
             stream = SymbolStream(
                 self.cfg.ws_base, symbol, ctx.on_event,
                 depth_levels=self.cfg.depth_levels,
                 depth_speed_ms=self.cfg.depth_speed_ms,
                 intervals=[self.cfg.micro_interval, self.cfg.ltf_fast, self.cfg.ltf_slow],
+                idle_timeout=self.cfg.ws_flow_idle_timeout_sec,
             )
             await stream.start()
             self.streams[symbol] = stream
         except Exception as exc:  # noqa: BLE001
             log.warning("failed to arm %s: %s", symbol, exc)
             await self._disarm(symbol, "arm failed")
+
+    def _ws_usable(self) -> bool:
+        """Has the websocket transport shown any sign of life?"""
+        if self.mark.last_msg_ts:
+            return True
+        return self.mark.silent_drops < 3 and self.mark.reconnects < 5
+
+    def _armed_capacity(self) -> int:
+        """In REST-only mode each armed symbol costs real request weight, so
+        the concurrent limit tightens automatically."""
+        if self._ws_usable():
+            return self.cfg.max_armed_symbols
+        return min(self.cfg.max_armed_symbols, self.cfg.max_armed_fallback)
 
     async def _disarm(self, symbol: str, reason: str) -> None:
         stream = self.streams.pop(symbol, None)
@@ -343,45 +410,96 @@ class SniperEngine:
     # ============================================================ confirmation
     async def _evaluate_armed(self) -> None:
         for symbol in list(self.armed.keys()):
-            ctx = self.armed.get(symbol)
-            if ctx is None:
-                continue
+            try:
+                await self._evaluate_one(symbol)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                # one bad symbol must never stop the others being evaluated
+                log.exception("evaluation failed for %s: %s", symbol, exc)
 
-            if ctx.expired:
-                await self._disarm(symbol, "arm window expired")
-                self.cooldown[symbol] = time.time() + 900
-                continue
-            if not ctx.warm:
-                continue
-            if not ctx.still_in_range():
-                await self._disarm(symbol, "price left the zone")
-                self.cooldown[symbol] = time.time() + 600
-                continue
-            if self.paused or self.monitor.count >= self.cfg.max_active_trades:
-                continue
+    async def _evaluate_one(self, symbol: str) -> None:
+        ctx = self.armed.get(symbol)
+        if ctx is None:
+            return
 
-            ctx.evaluations += 1
-            self.evaluations += 1
-            decision = evaluate(ctx, self.cfg, self.trend.get(symbol, "range"))
-            ctx.last_eval = time.time()
-            ctx.last_blockers = decision.blockers
+        if ctx.expired:
+            await self._disarm(symbol, "arm window expired")
+            self.cooldown[symbol] = time.time() + 900
+            return
+        if not ctx.warm:
+            return
+        if not ctx.still_in_range():
+            await self._disarm(symbol, "price left the zone")
+            self.cooldown[symbol] = time.time() + 600
+            return
 
-            if not decision.passed:
-                for b in decision.blockers:
-                    self.blockers[b.split("(")[0]] += 1
-                self.rejected += 1
-                continue
+        # a context whose feed died and cannot be revived over REST is a
+        # zombie: it holds memory and can only ever score frozen data
+        if not ctx.flow_fresh(self.cfg.max_flow_age_sec * 3):
+            await self._disarm(symbol, f"no flow data for {int(ctx.flow_age)}s")
+            self.cooldown[symbol] = time.time() + 600
+            return
 
-            opposing = self.zone_engine.opposing_target(
-                self.zones.get(symbol, []), ctx.direction, ctx.price)
-            signal = build_signal(ctx, decision, self.cfg, opposing)
-            if signal is None:
-                for b in decision.blockers:
-                    self.blockers[b.split("(")[0]] += 1
-                self.rejected += 1
-                continue
+        if self.paused or self.monitor.count >= self.cfg.max_active_trades:
+            return
 
-            await self._dispatch(signal, ctx)
+        ctx.evaluations += 1
+        self.evaluations += 1
+        decision = evaluate(ctx, self.cfg, self.trend.get(symbol, "range"))
+        ctx.last_eval = time.time()
+        ctx.last_blockers = decision.blockers
+
+        if not decision.passed:
+            self._record_blockers(decision.blockers)
+            return
+
+        opposing = self.zone_engine.opposing_target(
+            self.zones.get(symbol, []), ctx.direction, ctx.price)
+        signal = build_signal(ctx, decision, self.cfg, opposing)
+        if signal is None:
+            self._record_blockers(decision.blockers)
+            return
+
+        await self._dispatch(signal, ctx)
+
+    def _record_blockers(self, blockers: List[str]) -> None:
+        for b in blockers:
+            self.blockers[b.split("(")[0]] += 1
+        self.rejected += 1
+
+    async def _loop_flow_fallback(self) -> None:
+        """
+        Keep armed symbols alive over REST when their WebSocket is silent.
+
+        This is what lets the engine keep working on networks that accept the
+        WS handshake and then deliver nothing - a surprisingly common situation
+        on cloud hosts in restricted regions.
+        """
+        if not self.cfg.rest_fallback:
+            return
+        while not self._stop.is_set():
+            await asyncio.sleep(self.cfg.flow_poll_sec)
+            try:
+                stalled = [
+                    (sym, ctx) for sym, ctx in self.armed.items()
+                    if ctx.seeded and ctx.feed_age > self.cfg.ws_flow_idle_timeout_sec
+                ]
+                if not stalled:
+                    continue
+                # oldest data first, capped so a dead network cannot burn the
+                # whole weight budget on order-flow polling
+                stalled.sort(key=lambda kv: -kv[1].flow_age)
+                for symbol, ctx in stalled[: self.cfg.max_armed_fallback]:
+                    if symbol not in self.armed:
+                        continue
+                    got = await ctx.poll_rest(self.rest)
+                    log.info("REST flow poll %s (ws silent %.0fs, new trades: %s)",
+                             symbol, ctx.feed_age, "yes" if got else "none")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                log.exception("flow fallback error: %s", exc)
 
     async def _dispatch(self, signal: Signal, ctx: ArmedContext) -> None:
         if await self.db.has_open_for(signal.symbol):
@@ -396,7 +514,12 @@ class SniperEngine:
             await self.monitor.add(row)
 
         fresh = " · fresh" if ctx.zone.touches == 0 else f" · tested {ctx.zone.touches}x"
-        await self.bot.send(fmt.signal_message(signal, signal_id, fresh))
+        try:
+            await self.bot.send(fmt.signal_message(signal, signal_id, fresh))
+        except Exception as exc:  # noqa: BLE001
+            # the setup is already persisted and monitored - a delivery failure
+            # must not abort the disarm/cooldown bookkeeping below
+            log.warning("could not deliver signal #%d: %s", signal_id, exc)
 
         self.signals_total += 1
         self.signals_today += 1
@@ -409,10 +532,9 @@ class SniperEngine:
 
     # ============================================================ trade events
     async def _trade_event(self, trade: dict, kind: str, info: dict) -> None:
-        if kind in ("TP1", "TP2"):
-            await self.bot.send(fmt.tp_alert(trade, kind, info))
-        else:
-            await self.bot.send(fmt.close_alert(trade, kind, info))
+        text = fmt.tp_alert(trade, kind, info) if kind in ("TP1", "TP2") \
+            else fmt.close_alert(trade, kind, info)
+        await self.bot.send(text)
 
     async def _release_symbol(self, symbol: str) -> None:
         """Setup finished - the coin goes back into the hunting pool."""
@@ -433,7 +555,7 @@ class SniperEngine:
             "a_plus": len([z for z in zones if z.grade == "A+"]),
             "a_grade": len([z for z in zones if z.grade == "A"]),
             "armed": len(self.armed),
-            "max_armed": self.cfg.max_armed_symbols,
+            "max_armed": self._armed_capacity(),
             "signals_today": self.signals_today,
             "signals_total": self.signals_total,
             "cycles": self.cycles,
@@ -460,7 +582,13 @@ class SniperEngine:
             "weight_budget": snap["budget"],
             "markprice_ok": self.mark.alive and self.mark.stale_for < 30,
             "markprice_symbols": len(self.mark.prices),
-            "markprice_age": self.mark.stale_for if self.mark.last_msg_ts else 999,
+            "markprice_age": self.mark.describe_staleness(),
+            "price_source": self.price_source,
+            "rest_price_symbols": len(self.rest_prices),
+            "silent_sockets": self.mark.silent_drops + sum(s.silent_drops for s in self.streams.values()),
+            "rest_polls": sum(c.rest_polls for c in self.armed.values()),
+            "weight_waits": snap["waits"],
+            "penalty_sec": snap["penalty_sec"],
             "flow_streams": len(self.streams),
             "reconnects": self.mark.reconnects + sum(s.reconnects for s in self.streams.values()),
             "db_path": self.cfg.db_path,
@@ -490,7 +618,8 @@ class SniperEngine:
 
         if cmd == "zones":
             if not args:
-                top = sorted(self.zones.items(), key=lambda kv: -max(z.score for z in kv[1]))[:12]
+                populated = {s: zs for s, zs in self.zones.items() if zs}
+                top = sorted(populated.items(), key=lambda kv: -max(z.score for z in kv[1]))[:12]
                 if not top:
                     return "No graded zones stored yet - the first scan may still be running."
                 lines = ["🧭 <b>TOP ZONES</b> (use /zones SYMBOL for detail)"]

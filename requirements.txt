@@ -1,3 +1,7 @@
+# Verified against aiohttp 3.9-3.12 and websockets 12.x-17.x.
+# The websocket client API used here (connect() as an async context manager
+# plus recv()) is stable across both the legacy and the new asyncio
+# implementations, so no upper pin is needed.
 aiohttp>=3.9.0,<4.0.0
-websockets>=12.0,<14.0
+websockets>=12.0
 python-dotenv>=1.0.0

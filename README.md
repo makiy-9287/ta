@@ -286,6 +286,31 @@ sniper_flow/
 
 ---
 
+## When the network fights back
+
+Some hosts — cloud instances in restricted regions especially — accept the
+Binance WebSocket handshake, answer pings, and then never deliver a single
+payload. At the transport layer that is indistinguishable from a healthy
+connection, so the engine watches for *data*, not connectivity:
+
+- a socket that goes quiet past `WS_IDLE_TIMEOUT_SEC` is torn down and retried
+- the mark-price stream rotates through three endpoint spellings before
+  concluding the network is the problem
+- prices fall back to `ticker/price` (weight 2 for every symbol), cached
+- armed symbols fall back to REST order-flow polling every `FLOW_POLL_SEC`,
+  capped at `MAX_ARMED_FALLBACK` symbols so a dead network cannot burn the
+  weight budget
+- repeatedly silent endpoints get an escalating backoff instead of a hammering
+- `/health` states plainly which transport is in use
+
+**Signals still fire in REST-only mode**, at coarser flow resolution. What the
+engine will *not* do is trade stale data: if order flow has not advanced within
+`MAX_FLOW_AGE_SEC`, every setup is blocked with `stale_flow`, and a context
+whose feed cannot be revived is disarmed rather than left scoring a frozen
+snapshot.
+
+---
+
 ## Disclaimer
 
 This is an analysis and alerting tool. It produces trade *ideas* from public
