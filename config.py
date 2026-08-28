@@ -52,7 +52,8 @@ class Settings:
     # ---------------------------------------------------------------- binance
     rest_base: str = field(default_factory=lambda: _s("BINANCE_REST", "https://fapi.binance.com"))
     ws_base: str = field(default_factory=lambda: _s("BINANCE_WS", "wss://fstream.binance.com"))
-    weight_budget: int = field(default_factory=lambda: _i("WEIGHT_BUDGET_PER_MIN", 1100))  # hard cap 2400
+    weight_budget: int = field(default_factory=lambda: _i("WEIGHT_BUDGET_PER_MIN", 1100))
+    bulk_weight_share: float = field(default_factory=lambda: _f("BULK_WEIGHT_SHARE", 0.65))  # hard cap 2400
     rest_timeout: int = field(default_factory=lambda: _i("REST_TIMEOUT", 20))
 
     # ---------------------------------------------------------------- watchlist

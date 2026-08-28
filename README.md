@@ -196,11 +196,21 @@ rejected, which tells you whether your thresholds match current conditions.
 ## Rate limits and memory
 
 Binance allows 2400 request-weight per minute per IP. The engine runs on a
-self-imposed budget (`WEIGHT_BUDGET_PER_MIN`, default **1100**), enforced by a
-sliding-window limiter that also reads the exchange's own
-`X-MBX-USED-WEIGHT-1M` header and backs off hard on 418/429. A full zone
-rebuild of 220 symbols is ~2200 weight, which the limiter simply paces across
-two minutes.
+self-imposed budget (`WEIGHT_BUDGET_PER_MIN`, default **1100**) and backs off
+hard on 418/429.
+
+Accounting is anchored to the exchange's own `X-MBX-USED-WEIGHT-1M` header:
+pressure is the last reading plus whatever has been spent since it was taken.
+That matters because Binance meters in fixed one-minute buckets that reset on
+the boundary — a purely local sliding window keeps charging for requests the
+exchange has already forgotten, and will stall the engine against pressure that
+no longer exists.
+
+Weight is also **prioritised**. Background work — the periodic zone rebuild and
+the 24h ticker sweep — is capped at 65% of the budget, so prices, arming and
+trade monitoring always have headroom. A full rebuild of 220 symbols is ~2200
+weight; the limiter paces it across a few minutes rather than letting it freeze
+everything else for a minute.
 
 Memory stays flat because:
 

@@ -47,7 +47,7 @@ log = get_logger("engine")
 class SniperEngine:
     def __init__(self, cfg: Settings):
         self.cfg = cfg
-        self.limiter = WeightLimiter(cfg.weight_budget)
+        self.limiter = WeightLimiter(cfg.weight_budget, cfg.bulk_weight_share)
         self.rest = BinanceREST(cfg.rest_base, self.limiter, cfg.rest_timeout)
         self.db = Database(cfg.db_path)
         self.bot = TelegramBot(cfg.telegram_token, cfg.telegram_chat_id,
@@ -64,6 +64,7 @@ class SniperEngine:
         self.cooldown: Dict[str, float] = {}
         self.rest_prices: Dict[str, float] = {}
         self._rest_price_ts = 0.0
+        self._price_warn_ts = 0.0
         self.price_source = "starting"
 
         self._arm_lock = asyncio.Lock()
@@ -279,8 +280,10 @@ class SniperEngine:
         cfg = self.cfg
         if symbol in self.armed or self.monitor.has(symbol):
             return  # never move the goalposts mid-setup
-        htf = await self.rest.klines(symbol, cfg.htf_interval, cfg.candle_limit)
-        mtf = await self.rest.klines(symbol, cfg.mtf_interval, cfg.candle_limit)
+        # background work: capped so it can never starve prices, arming or
+        # the trade monitor of request weight
+        htf = await self.rest.klines(symbol, cfg.htf_interval, cfg.candle_limit, bulk=True)
+        mtf = await self.rest.klines(symbol, cfg.mtf_interval, cfg.candle_limit, bulk=True)
         if len(htf) < 100:
             return
         zones = self.zone_engine.build(symbol, htf, mtf)
@@ -308,7 +311,7 @@ class SniperEngine:
             return self.rest_prices
         try:
             # ticker/price costs weight 2 for every symbol; premiumIndex is 10
-            data = await asyncio.wait_for(self.rest.ticker_prices(), timeout=20)
+            data = await asyncio.wait_for(self.rest.ticker_prices(), timeout=30)
             prices = {d["symbol"]: float(d["price"]) for d in data if d.get("price")}
             if prices:
                 self.rest_prices = prices
@@ -318,7 +321,10 @@ class SniperEngine:
                                 self.mark.describe_staleness())
                 self.price_source = "rest"
         except asyncio.TimeoutError:
-            log.warning("REST price fallback timed out")
+            if now - self._price_warn_ts > 300:
+                self._price_warn_ts = now
+                log.warning("REST price fallback timed out (weight %s) - prices may lag",
+                            self.limiter.snapshot())
         except Exception as exc:  # noqa: BLE001
             log.debug("rest price fallback failed: %s", exc)
         return self.rest_prices

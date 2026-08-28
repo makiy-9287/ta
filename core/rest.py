@@ -59,13 +59,13 @@ class BinanceREST:
         self._session = None
 
     async def _get(self, path: str, params: Optional[Dict[str, Any]] = None,
-                   weight: int = 1, retries: int = 3) -> Any:
+                   weight: int = 1, retries: int = 3, bulk: bool = False) -> Any:
         await self.start()
         url = f"{self.base}{path}"
         last_err: Optional[Exception] = None
 
         for attempt in range(retries):
-            await self.limiter.acquire(weight)
+            await self.limiter.acquire(weight, bulk=bulk)
             try:
                 async with self._session.get(url, params=params) as resp:
                     used = resp.headers.get("X-MBX-USED-WEIGHT-1M")
@@ -101,7 +101,7 @@ class BinanceREST:
         return await self._get("/fapi/v1/exchangeInfo", weight=1)
 
     async def ticker_24h(self) -> List[dict]:
-        return await self._get("/fapi/v1/ticker/24hr", weight=40)
+        return await self._get("/fapi/v1/ticker/24hr", weight=40, bulk=True)
 
     async def mark_prices(self) -> List[dict]:
         return await self._get("/fapi/v1/premiumIndex", weight=10)
@@ -112,11 +112,11 @@ class BinanceREST:
         return await self._get("/fapi/v1/ticker/price", weight=2)
 
     async def klines(self, symbol: str, interval: str, limit: int = 500,
-                     end_time: Optional[int] = None) -> List[Candle]:
+                     end_time: Optional[int] = None, bulk: bool = False) -> List[Candle]:
         params: Dict[str, Any] = {"symbol": symbol, "interval": interval, "limit": limit}
         if end_time:
             params["endTime"] = end_time
-        raw = await self._get("/fapi/v1/klines", params, weight=kline_weight(limit))
+        raw = await self._get("/fapi/v1/klines", params, weight=kline_weight(limit), bulk=bulk)
         return [Candle.from_rest(r) for r in raw]
 
     async def depth(self, symbol: str, limit: int = 100) -> dict:

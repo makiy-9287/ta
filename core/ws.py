@@ -29,6 +29,8 @@ Handler = Callable[[str, dict], Awaitable[None]]
 
 
 class _BaseStream:
+    QUIET_AFTER = 6          # stop shouting once the network is clearly the problem
+
     def __init__(self, url: str, name: str, idle_timeout: float = 60.0):
         self.urls = [url] if isinstance(url, str) else list(url)
         self.url = self.urls[0]
@@ -118,10 +120,17 @@ class _BaseStream:
                     # variant next time round (if the stream defines any)
                     self.silent_drops += 1
                     self._url_index += 1
-                    if len(self.urls) > 1:
+                    if self.silent_drops == self.QUIET_AFTER:
+                        log.warning(
+                            "ws %s: %d endpoints tried, none delivered data. This host "
+                            "appears unable to receive Binance websocket traffic; the "
+                            "engine will keep retrying quietly and run on REST polling.",
+                            self.name, self.silent_drops)
+                    elif self.silent_drops < self.QUIET_AFTER and len(self.urls) > 1:
                         log.warning("ws %s silent on %s - switching endpoint",
                                     self.name, self.url.rsplit("/", 1)[-1][:48])
-                log.warning("ws %s dropped (%s) - reconnect in %.0fs", self.name, exc, backoff)
+                speak = log.warning if self.silent_drops < self.QUIET_AFTER else log.debug
+                speak("ws %s dropped (%s) - reconnect in %.0fs", self.name, exc, backoff)
                 await asyncio.sleep(backoff)
                 # once an endpoint has proven repeatedly silent, stop hammering
                 # it - the network is likely blocking us, and connection

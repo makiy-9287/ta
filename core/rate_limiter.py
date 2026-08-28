@@ -28,8 +28,12 @@ WINDOW = 60.0
 
 
 class WeightLimiter:
-    def __init__(self, budget_per_min: int = 1100):
+    def __init__(self, budget_per_min: int = 1100, bulk_share: float = 0.65):
         self.budget = max(60, int(budget_per_min))
+        # background work (the periodic zone rebuild) may only ever consume
+        # part of the budget, so latency-sensitive calls - prices, arming,
+        # trade monitoring - always have headroom left to them
+        self.bulk_budget = max(30, int(self.budget * bulk_share))
         self._events: Deque[Tuple[float, int]] = deque()
         self._lock = asyncio.Lock()
         self._reported_weight = 0
@@ -42,26 +46,55 @@ class WeightLimiter:
         while self._events and self._events[0][0] < cutoff:
             self._events.popleft()
 
-    def _effective_reported(self, now: float) -> int:
-        """The header reading, decayed linearly across the exchange's minute."""
+    def _local_since(self, since: float) -> int:
+        return sum(w for ts, w in self._events if ts >= since)
+
+    def _effective(self, now: float) -> int:
+        """
+        Current pressure on the IP.
+
+        The exchange's own header is ground truth, so when we have a recent
+        reading we anchor to it and add only what we have spent since it was
+        taken. Our local sliding window is a fallback estimate for when no
+        reading is available.
+
+        This matters: the exchange counts in fixed one-minute buckets that
+        reset on the boundary, while a sliding window keeps charging us for
+        requests the exchange has already forgotten. Trusting the window alone
+        made the engine throttle itself against pressure that no longer
+        existed - a full minute of self-inflicted stalling after every zone
+        rebuild.
+        """
+        local = self._local_since(now - WINDOW)
         if not self._reported_at:
-            return 0
+            return local
         age = now - self._reported_at
         if age >= WINDOW:
+            return local
+        return self._reported_weight + self._local_since(self._reported_at)
+
+    def _effective_reported(self, now: float) -> int:
+        if not self._reported_at or (now - self._reported_at) >= WINDOW:
             return 0
-        return int(self._reported_weight * (1.0 - age / WINDOW))
+        return self._reported_weight
 
     @property
     def used(self) -> int:
-        self._prune(time.time())
-        return sum(w for _, w in self._events)
+        now = time.time()
+        self._prune(now)
+        return self._effective(now)
 
     @property
     def reported(self) -> int:
         return self._effective_reported(time.time())
 
-    async def acquire(self, weight: int) -> None:
+    async def acquire(self, weight: int, bulk: bool = False) -> None:
+        """
+        Reserve request weight. `bulk=True` marks background work that must
+        yield to latency-sensitive calls.
+        """
         weight = max(1, int(weight))
+        cap = self.bulk_budget if bulk else self.budget
         waited = 0.0
         while True:
             async with self._lock:
@@ -70,9 +103,8 @@ class WeightLimiter:
                     wait = self._banned_until - now
                 else:
                     self._prune(now)
-                    local = sum(w for _, w in self._events)
-                    effective = max(local, self._effective_reported(now))
-                    if effective + weight <= self.budget:
+                    effective = self._effective(now)
+                    if effective + weight <= cap:
                         self._events.append((now, weight))
                         return
                     # wait for the oldest local event to age out, or for the
@@ -84,9 +116,11 @@ class WeightLimiter:
             step = min(wait, 5.0)
             waited += step
             self._waits += 1
-            if waited >= 20.0 and self._waits % 4 == 0:
-                log.warning("waiting %.0fs on the weight budget (local=%d reported=%d budget=%d)",
-                            waited, self.used, self.reported, self.budget)
+            if waited >= 20.0 and self._waits % 8 == 0:
+                log.warning("waiting %.0fs on the weight budget "
+                            "(effective=%d cap=%d reported=%d age=%.0fs)",
+                            waited, self._effective(time.time()), cap, self._reported_weight,
+                            time.time() - self._reported_at if self._reported_at else -1)
             await asyncio.sleep(step)
 
     def sync_from_header(self, used_weight: int) -> None:
@@ -109,6 +143,7 @@ class WeightLimiter:
     def snapshot(self) -> dict:
         return {
             "used_local": self.used,
+            "bulk_budget": self.bulk_budget,
             "used_reported": self.reported,
             "raw_reported": self._reported_weight,
             "budget": self.budget,

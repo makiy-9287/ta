@@ -425,6 +425,38 @@ async def _test_resilience(zone) -> bool:
         blocked = True
     ok &= check("fresh weight reading still enforces the budget", blocked)
 
+    # 2b. the exchange header is ground truth: a local sliding-window estimate
+    #     must never keep throttling us after the exchange's minute has reset
+    lim3 = WeightLimiter(1100)
+    burst = time.time()
+    for _ in range(1089):
+        lim3._events.append((burst, 1))       # the startup zone-rebuild burst
+    saturated = lim3.used
+    lim3.sync_from_header(1)                  # exchange minute rolled over
+    started = time.time()
+    await asyncio.wait_for(lim3.acquire(2), timeout=3)
+    ok &= check("exchange header overrides a saturated local estimate",
+                saturated > 1000 and lim3.used <= 10 and (time.time() - started) < 1,
+                f"local {saturated} -> anchored {lim3.used}")
+
+    # 2c. background work must not be able to starve latency-sensitive calls
+    lim4 = WeightLimiter(1100)
+    for _ in range(lim4.bulk_budget):
+        lim4._events.append((time.time(), 1))
+    bulk_blocked = False
+    try:
+        await asyncio.wait_for(lim4.acquire(5, bulk=True), timeout=1)
+    except asyncio.TimeoutError:
+        bulk_blocked = True
+    priority_ok = True
+    try:
+        await asyncio.wait_for(lim4.acquire(2), timeout=1)
+    except asyncio.TimeoutError:
+        priority_ok = False
+    ok &= check("bulk work throttles while priority calls keep headroom",
+                bulk_blocked and priority_ok,
+                f"bulk cap {lim4.bulk_budget} of {lim4.budget}")
+
     # 3. a silent socket must be detected rather than treated as healthy
     from core.ws import MarkPriceStream
     st = MarkPriceStream("wss://example.invalid", idle_timeout=2)

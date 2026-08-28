@@ -1,5 +1,33 @@
 # Changelog
 
+## 1.0.2 — rate limiter, round two
+
+Found from a second live run: `waiting 20s on the weight budget
+(local=1099 reported=1 budget=1100)` followed by `REST price fallback timed out`.
+
+**5. Local accounting fought the exchange's own numbers.**
+Binance meters in fixed one-minute buckets that reset on the boundary; the
+limiter used a *sliding* 60-second window. After the startup burst the window
+still held 1099 while the exchange had already reset to 1, so the engine
+throttled itself against pressure that no longer existed — stalling prices,
+arming and monitoring for a full minute.
+*Fix:* the header is now treated as ground truth. Pressure is measured as the
+last reading plus only what has been spent since it was taken, which is both
+accurate and self-correcting. The sliding window survives as a fallback for
+when no reading is available.
+
+**6. The zone rebuild monopolised the entire budget.**
+88 symbols x 2 timeframes x 600 candles = 880 weight in about 8 seconds, on a
+1100 budget — nothing left for prices, arming or the trade monitor.
+*Fix:* request weight is now prioritised. Background work (the periodic zone
+rebuild, the 24h ticker sweep) is capped at `bulk_share` of the budget (65% by
+default), permanently reserving headroom for latency-sensitive calls. The
+rebuild simply takes a little longer instead of freezing the engine.
+
+Also: the REST price fallback warning is throttled to once per five minutes,
+and websocket reconnect logging goes quiet after six silent endpoints with one
+clear explanation instead of a warning every 45 seconds.
+
 ## 1.0.1 — bug hunt
 
 Fixes found from a live deployment where Telegram commands stopped responding
