@@ -1,0 +1,441 @@
+"""
+Offline self-test.
+
+Builds a synthetic market that contains, by construction, exactly the setup
+this engine is supposed to find:
+
+    a 4H demand zone with clustered lows, rejection wicks, displacement out,
+    untapped liquidity below it, and a 1H zone sitting on top of it
+      -> price returns, sweeps the prior swing low, gets absorbed by passive
+         bids, CVD diverges, price reclaims and shifts structure on 3m/5m
+
+Then it runs the real detection code over that data and asserts each stage
+fires. No network, no Telegram token, no database credentials required:
+
+    python main.py --selftest
+"""
+from __future__ import annotations
+
+import asyncio
+import os
+import random
+import tempfile
+import time
+from typing import List, Tuple
+
+from config import SETTINGS
+from core.armed import ArmedContext
+from core.confirm import evaluate
+from core.database import Database
+from core.indicators import atr, cvd_divergence, htf_trend
+from core.models import Candle
+from core.monitor import TradeMonitor
+from core.risk import build_signal
+from core.structure import detect_mss, detect_sweep
+from core.utils import get_logger
+from core.zones import ZoneEngine
+
+log = get_logger("selftest")
+random.seed(7)
+
+PASS, FAIL = "  \033[92mPASS\033[0m", "  \033[91mFAIL\033[0m"
+_results: List[Tuple[str, bool, str]] = []
+
+
+def check(name: str, ok: bool, note: str = "") -> bool:
+    _results.append((name, bool(ok), note))
+    print(f"{PASS if ok else FAIL}  {name}" + (f"  ({note})" if note else ""))
+    return bool(ok)
+
+
+# ----------------------------------------------------------------- generators
+def _candle(ts: int, o: float, c: float, spread: float, vol: float,
+            buy_ratio: float, low_wick: float = 0.0, high_wick: float = 0.0) -> Candle:
+    hi = max(o, c) + spread + high_wick
+    lo = min(o, c) - spread - low_wick
+    return Candle(ts=ts, open=o, high=hi, low=lo, close=c, volume=vol,
+                  quote_volume=vol * c, trades=int(vol), taker_buy=vol * buy_ratio,
+                  close_ts=ts + 1)
+
+
+def zigzag(points: List[float], per_leg: int, start_ts: int, interval_ms: int,
+           base_vol: float = 1000.0) -> List[Candle]:
+    """Legs between turning points, with rejection wicks and displacement."""
+    candles: List[Candle] = []
+    ts = start_ts
+    for li in range(len(points) - 1):
+        a, b = points[li], points[li + 1]
+        up = b > a
+        for i in range(per_leg):
+            o = a + (b - a) * (i / per_leg)
+            c = a + (b - a) * ((i + 1) / per_leg)
+            noise = abs(b - a) / per_leg * 0.25
+            spread = noise + abs(o) * 0.0008
+            vol = base_vol * random.uniform(0.75, 1.25)
+            ratio = 0.62 if up else 0.38
+            last = i == per_leg - 1
+            lw = hw = 0.0
+            if last and not up:                       # trough: long rejection wick
+                lw = abs(b - a) * 0.10 + abs(o) * 0.0012
+                c = c + (spread * 1.5)
+                vol *= 2.8
+                ratio = 0.28                          # heavy aggressive selling
+            elif last and up:                         # peak
+                hw = abs(b - a) * 0.10
+                vol *= 1.8
+                ratio = 0.70
+            candles.append(_candle(ts, o, c, spread, vol, ratio, lw, hw))
+            ts += interval_ms
+        # displacement candle out of the turn
+        if li + 2 <= len(points) - 1:
+            nxt = points[li + 2]
+            o = b
+            c = b + (nxt - b) * 0.35
+            candles.append(_candle(ts, o, c, abs(c - o) * 0.12, base_vol * 2.2,
+                                   0.72 if c > o else 0.28))
+            ts += interval_ms
+    return candles
+
+
+def build_htf() -> List[Candle]:
+    """4H: a range that keeps rejecting the 100.0-100.35 area."""
+    pts = [116, 104, 100.25, 113, 101.0, 114.5, 100.15, 112.0, 100.10, 106.0, 100.9]
+    return zigzag(pts, 26, start_ts=1_700_000_000_000, interval_ms=4 * 3600 * 1000)
+
+
+def build_mtf() -> List[Candle]:
+    """1H: same demand area, so the zones overlap."""
+    pts = [110, 100.30, 108, 100.20, 107, 100.18, 104, 100.9]
+    return zigzag(pts, 34, start_ts=1_700_000_000_000, interval_ms=3600 * 1000)
+
+
+def build_ltf(zone, interval_ms: int, bars: int) -> List[Candle]:
+    """
+    Descent into the detected zone -> sweep of the prior swing low -> reclaim.
+    Everything is expressed relative to the real zone so the lower-timeframe
+    story lines up with the higher-timeframe map.
+    """
+    lo, hi, h = zone.low, zone.high, zone.height
+    legs = [
+        (hi + 2.6 * h, hi + 1.5 * h, 0.24),   # trend down toward the zone
+        (hi + 1.5 * h, hi + 1.1 * h, 0.07),   # minor pullback -> swing high
+        (hi + 1.1 * h, lo + 0.30 * h, 0.22),  # into the zone -> prior swing low
+        (lo + 0.30 * h, lo + 0.85 * h, 0.11), # weak bounce
+        (lo + 0.85 * h, lo - 0.22 * h, 0.15), # THE SWEEP
+        (lo - 0.22 * h, hi + 0.45 * h, 0.11), # reclaim + structure shift
+    ]
+    total = sum(w for *_, w in legs)
+    ts = 1_700_000_000_000
+    out: List[Candle] = []
+    for a, b, weight in legs:
+        n = max(4, int(bars * weight / total))
+        up = b > a
+        for i in range(n):
+            o = a + (b - a) * (i / n)
+            c = a + (b - a) * ((i + 1) / n)
+            jitter = abs(b - a) / n * random.uniform(-0.12, 0.12)
+            c += jitter
+            spread = abs(b - a) / n * 0.30 + h * 0.01
+            vol = random.uniform(80, 140)
+            ratio = 0.60 if up else 0.40
+            lw = 0.0
+            if not up and i == n - 1:
+                lw = h * 0.05
+                ratio = 0.22
+                vol *= 2.5
+            out.append(_candle(ts, o, c, spread, vol, ratio, lw))
+            ts += interval_ms
+    return out
+
+
+def build_micro_cvd(zone, bars: int = 110) -> List[Candle]:
+    """
+    1m series engineered for a bullish CVD divergence: the first low prints on
+    brutal aggressive selling, the second (lower) low on far weaker selling,
+    so cumulative delta makes a higher low while price makes a lower low.
+    """
+    lo, hi, h = zone.low, zone.high, zone.height
+    legs = [
+        (hi + 1.4 * h, lo + 0.75 * h, 34, 0.30),   # heavy aggressive selling
+        (lo + 0.75 * h, hi + 0.90 * h, 20, 0.72),  # buyers step in
+        (hi + 0.90 * h, lo - 0.22 * h, 34, 0.455), # lower low, weak selling
+        (lo - 0.22 * h, hi + 0.45 * h, 22, 0.70),  # reclaim
+    ]
+    ts = 1_700_000_000_000
+    out: List[Candle] = []
+    for a, b, n, ratio in legs:
+        for i in range(n):
+            o = a + (b - a) * (i / n)
+            c = a + (b - a) * ((i + 1) / n) + abs(b - a) / n * random.uniform(-0.08, 0.08)
+            vol = random.uniform(90, 110)
+            out.append(_candle(ts, o, c, h * 0.006, vol, ratio))
+            ts += 60_000
+    return out
+
+
+def build_agg_trades(zone, ctx_ts: int) -> List[dict]:
+    """
+    Order flow for the sweep window: a wall of aggressive selling into the
+    lows that the market absorbs, then an aggressive buy-driven reclaim.
+    """
+    lo, hi, h = zone.low, zone.high, zone.height
+    sweep_low = lo - 0.22 * h
+    reclaim = hi + 0.45 * h
+    step = max(0.01, round(h * 0.05, 4))
+    trades: List[dict] = []
+    ts = ctx_ts - 22 * 60 * 1000
+
+    def push(price: float, qty: float, maker_buy: bool, gap: int = 900):
+        nonlocal ts
+        trades.append({"p": f"{price:.4f}", "q": f"{qty:.3f}", "m": maker_buy, "T": ts})
+        ts += gap
+
+    for i in range(120):                                   # descent
+        push(lo + 0.85 * h - i * (h * 0.009), random.uniform(1, 3), True)
+    for i in range(320):                                   # the flush, absorbed
+        price = sweep_low + random.choice([0, 1, 2, 3, 4]) * step
+        push(price, random.uniform(9, 18), True, 400)
+        if i % 5 == 0:
+            push(price + step, random.uniform(1.5, 3), False, 200)
+    price = sweep_low + 2 * step                           # the reclaim
+    while price < reclaim:
+        for _ in range(9):
+            push(price, random.uniform(4, 9), False, 250)
+        push(price - step * 0.2, random.uniform(0.2, 0.5), True, 120)
+        price += step * 1.4
+    for _ in range(40):
+        push(reclaim, random.uniform(2, 5), False, 300)
+    return trades
+
+
+def feed_depth(ctx: ArmedContext, zone, ts: int) -> None:
+    """A real bid wall that gets touched and eaten - order book 'case B'."""
+    lo, h = zone.low, zone.height
+    wall_price = lo - 0.10 * h
+    for i in range(28):
+        mid = (lo + 0.85 * h) - i * (h * 0.05) if i < 20 else wall_price + (i - 20) * (h * 0.12)
+        wall_qty = 900.0 if i < 12 else max(60.0, 900.0 - (i - 11) * 110.0)
+        bids = [[f"{wall_price:.4f}", f"{wall_qty:.2f}"]] + [
+            [f"{mid - h * 0.02 * (k + 1):.4f}", f"{random.uniform(40, 90):.2f}"] for k in range(19)]
+        asks = [[f"{mid + h * 0.02 * (k + 1):.4f}", f"{random.uniform(25, 55):.2f}"] for k in range(20)]
+        ctx.depth.update(bids, asks, ts + i * 500)
+
+
+# ---------------------------------------------------------------------- tests
+def test_zones() -> Tuple[bool, object]:
+    htf, mtf = build_htf(), build_mtf()
+    engine = ZoneEngine(SETTINGS)
+    zones = engine.build("TESTUSDT", htf, mtf)
+    demand = [z for z in zones if z.kind == "demand"]
+
+    check("4H/1H candle series built", len(htf) > 200 and len(mtf) > 200,
+          f"{len(htf)} x 4H, {len(mtf)} x 1H")
+    ok = check("graded zones detected", bool(zones), f"{len(zones)} zones")
+    if not ok or not demand:
+        return False, None
+
+    best = max(demand, key=lambda z: z.score)
+    check("demand zone found near the engineered support", abs(best.mid - 100.2) < 1.5,
+          f"{best.low:.2f}-{best.high:.2f}")
+    check("zone graded A or A+", best.grade in ("A", "A+"),
+          f"{best.grade} {best.score}/100 {best.breakdown}")
+    check("HTF confluence scored", best.breakdown.get("htf_confluence", 0) >= 20,
+          str(best.breakdown.get("htf_confluence")))
+    check("liquidity scored", best.breakdown.get("liquidity", 0) >= 10,
+          str(best.breakdown.get("liquidity")))
+    check("score never exceeds 100", best.score <= 100, str(best.score))
+    check("4H trend classified", htf_trend(htf)["state"] in
+          ("strong_up", "up", "range", "down", "strong_down"), str(htf_trend(htf)["state"]))
+    return True, best
+
+
+def test_structure(zone) -> bool:
+    slow = build_ltf(zone, 5 * 60_000, 90)
+    fast = build_ltf(zone, 3 * 60_000, 120)
+    a = atr(slow, 14)
+    sweep = detect_sweep(slow, "LONG", SETTINGS, zone=zone, atr_val=a)
+    ok = check("liquidity sweep detected on 5m", bool(sweep.get("found")),
+               f"level {sweep.get('level', 0):.3f}, extreme {sweep.get('extreme', 0):.3f}")
+    ok &= check("swept level reclaimed", bool(sweep.get("reclaimed")))
+    mss = detect_mss(fast, "LONG", SETTINGS)
+    ok &= check("market structure shift on 3m", bool(mss.get("found")),
+                f"broke {mss.get('level', 0):.3f}")
+    return ok
+
+
+def test_cvd(zone) -> bool:
+    micro = build_micro_cvd(zone)
+    div = cvd_divergence(micro, "LONG", lookback=90, pivot=2)
+    return check("bullish CVD divergence detected", bool(div.get("found")),
+                 f"strength {div.get('strength', 0):.2f}")
+
+
+def test_orderflow(zone) -> Tuple[bool, ArmedContext]:
+    ctx = ArmedContext("TESTUSDT", zone, SETTINGS, tick_size=0.01, decimals=2,
+                       ref_price=zone.mid)
+    # fixed, bucket-aligned anchor: the test must not depend on the wall clock
+    now = 1_700_003_600_000
+    ctx.book.seed_from_rest(build_agg_trades(zone, now))
+    feed_depth(ctx, zone, now)
+    ctx.candles[SETTINGS.micro_interval] = build_micro_cvd(zone)
+    ctx.candles[SETTINGS.ltf_fast] = build_ltf(zone, 3 * 60_000, 120)
+    ctx.candles[SETTINGS.ltf_slow] = build_ltf(zone, 5 * 60_000, 90)
+    ctx.armed_at = time.time() - 600
+    ctx.seeded = True
+
+    health = ctx.book.health(SETTINGS.min_trades_for_flow)
+    check("footprint populated", health["enough"],
+          f"{health['trades']} trades in {health['buckets']} buckets")
+
+    absorb = ctx.book.absorption("LONG", SETTINGS.absorption_vol_mult,
+                                 SETTINGS.absorption_efficiency, 60 * 45)
+    check("absorption detected at the lows", absorb["found"],
+          f"{absorb['ratio']}x avg level, {int(absorb['share']*100)}% aggressive sells, "
+          f"recovery {absorb['recovery']}")
+
+    dex = ctx.book.delta_extreme("LONG", SETTINGS.delta_extreme_z, 60 * 45)
+    check("negative delta extreme detected", dex["found"], f"z={dex['z']}")
+
+    imb = ctx.book.imbalances(SETTINGS.imbalance_ratio, 60 * 45)
+    check("stacked buy imbalances in the reclaim", imb["buy_stack"] >= 2,
+          f"stack {imb['buy_stack']}, count {imb['buy_count']}")
+
+    ob = ctx.depth.analyse("LONG", zone.mid, SETTINGS)
+    check("order book wall consumed, not pulled (case B)",
+          ob["walls"]["case_b"] and not ob["liquidity_pulling"],
+          f"{ob['walls']['biggest']}")
+    return True, ctx
+
+
+def test_decision(ctx: ArmedContext) -> Tuple[bool, object]:
+    decision = evaluate(ctx, SETTINGS, trend_state="range")
+    ok = check("confirmation engine approves the setup", decision.passed,
+               f"confidence {decision.confidence}, blockers {decision.blockers}")
+    check("multiple confluences recorded", len(decision.reasons) >= 4,
+          f"{len(decision.reasons)} reasons")
+
+    signal = build_signal(ctx, decision, SETTINGS, opposing_level=None) if decision.passed else None
+    if signal is None:
+        check("signal levels built", False, str(decision.blockers))
+        return False, None
+
+    check("signal levels built",
+          signal.sl < signal.entry_low < signal.entry_high < signal.tp1 < signal.tp2 < signal.tp3,
+          f"SL {signal.sl:.2f} | entry {signal.entry_low:.2f}-{signal.entry_high:.2f} "
+          f"| TP {signal.tp1:.2f}/{signal.tp2:.2f}/{signal.tp3:.2f}")
+    check("risk within bounds",
+          SETTINGS.min_risk_pct <= signal.risk_pct <= SETTINGS.max_risk_pct,
+          f"{signal.risk_pct*100:.2f}%")
+    check("reward-to-risk acceptable", signal.rr >= SETTINGS.min_rr_after_cap, f"{signal.rr:.2f}")
+
+    # a setup fighting a strong opposing trend must be refused
+    blocked = evaluate(ctx, SETTINGS, trend_state="strong_down")
+    check("counter-trend setup rejected", not blocked.passed and
+          "against_4h_trend" in blocked.blockers)
+    return ok, signal
+
+
+async def _test_db(signal) -> bool:
+    path = os.path.join(tempfile.mkdtemp(prefix="sniper-selftest-"), "test.db")
+    db = Database(path)
+    await db.init()
+    sid = await db.insert_signal(signal)
+    ok = check("signal persisted to sqlite", sid > 0, f"id {sid}")
+
+    events = []
+
+    async def notify(trade, kind, info):
+        events.append((kind, round(info.get("r", 0), 2)))
+
+    released = []
+
+    async def release(symbol):
+        released.append(symbol)
+
+    monitor = TradeMonitor(db, SETTINGS, notify, release)
+    await monitor.load()
+    ok &= check("monitor picked up the open setup", monitor.count == 1)
+
+    await monitor.on_prices({signal.symbol: signal.tp1 + 0.001})
+    ok &= check("TP1 alert fired and stop moved to breakeven",
+                any(e[0] == "TP1" for e in events))
+
+    await monitor.on_prices({signal.symbol: signal.tp2 + 0.001})
+    ok &= check("TP2 alert fired", any(e[0] == "TP2" for e in events))
+
+    await monitor.on_prices({signal.symbol: signal.tp3 + 0.001})
+    ok &= check("TP3 closed the setup as a win", any(e[0] == "WIN" for e in events))
+    ok &= check("symbol released back to the watchlist pool", signal.symbol in released)
+
+    perf = await db.performance(0)
+    ok &= check("performance report computed",
+                perf["closed"] == 1 and perf["total_r"] > 2.5,
+                f"{perf['closed']} closed, {perf['total_r']:+.2f}R, winrate {perf['winrate']:.0f}%")
+
+    # stop-loss path on a fresh row
+    signal.symbol = "LOSSUSDT"
+    sid2 = await db.insert_signal(signal)
+    row = await db.signal(sid2)
+    await monitor.add(row)
+    await monitor.on_prices({"LOSSUSDT": signal.sl - 0.001})
+    ok &= check("stop loss path closes with a negative R",
+                any(e[0] == "LOSS" and e[1] < 0 for e in events), str(events))
+
+    await db.close()
+    return ok
+
+
+def test_formatting(signal) -> bool:
+    from notifier import formatter as fmt
+    msg = fmt.signal_message(signal, 1, " · fresh")
+    ok = check("telegram signal card renders", "SNIPER SIGNAL" in msg and "TP3" in msg,
+               f"{len(msg)} chars")
+    ok &= check("help card renders", "/status" in fmt.help_message())
+    return ok
+
+
+# ---------------------------------------------------------------------- runner
+def run_selftest() -> bool:
+    print("\n\033[1mSNIPER FLOW - offline self-test\033[0m")
+    print("Synthetic market -> zones -> order flow -> decision -> signal -> monitor\n")
+
+    print("\033[1m1. Support / resistance scoring\033[0m")
+    ok, zone = test_zones()
+    if not ok or zone is None:
+        _summary()
+        return False
+
+    print("\n\033[1m2. Market structure\033[0m")
+    test_structure(zone)
+
+    print("\n\033[1m3. CVD divergence\033[0m")
+    test_cvd(zone)
+
+    print("\n\033[1m4. Order flow (footprint / absorption / book)\033[0m")
+    _, ctx = test_orderflow(zone)
+
+    print("\n\033[1m5. Confirmation and risk model\033[0m")
+    ok, signal = test_decision(ctx)
+    if signal is None:
+        _summary()
+        return False
+
+    print("\n\033[1m6. Database and trade monitor\033[0m")
+    asyncio.run(_test_db(signal))
+
+    print("\n\033[1m7. Telegram rendering\033[0m")
+    test_formatting(signal)
+
+    return _summary()
+
+
+def _summary() -> bool:
+    passed = len([r for r in _results if r[1]])
+    total = len(_results)
+    print(f"\n\033[1m{passed}/{total} checks passed\033[0m")
+    failed = [r[0] for r in _results if not r[1]]
+    if failed:
+        print("Failed: " + ", ".join(failed))
+    else:
+        print("Every stage of the pipeline behaves as designed.\n")
+    return passed == total

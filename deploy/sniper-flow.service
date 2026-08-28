@@ -1,0 +1,44 @@
+[Unit]
+Description=Sniper Flow - Binance futures order-flow signal engine
+Documentation=file:/opt/sniper_flow/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# --- edit these three lines for your box -------------------------------
+User=sniper
+WorkingDirectory=/opt/sniper_flow
+ExecStart=/opt/sniper_flow/venv/bin/python main.py
+# -----------------------------------------------------------------------
+
+EnvironmentFile=/opt/sniper_flow/.env
+Restart=always
+RestartSec=15
+TimeoutStopSec=30
+KillSignal=SIGTERM
+
+# unbuffered stdout so journalctl shows logs live
+Environment=PYTHONUNBUFFERED=1
+
+# resource guards - the engine normally sits well under these
+MemoryMax=512M
+CPUQuota=80%
+
+# hardening: the process only needs outbound network and its own data dir
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/sniper_flow/data
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sniper-flow
+
+[Install]
+WantedBy=multi-user.target

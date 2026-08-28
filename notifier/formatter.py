@@ -1,0 +1,297 @@
+"""Message templates. Telegram HTML parse mode."""
+from __future__ import annotations
+
+import json
+import time
+from typing import Dict, List, Optional
+
+from core.models import Signal
+from core.utils import esc, fmt_price, fmt_pct, fmt_usd, human_delta, ts_to_str
+
+ARROW = {"LONG": "🟢", "SHORT": "🔴"}
+STATUS_ICON = {
+    "WIN": "🏆", "LOSS": "🛑", "BREAKEVEN": "⚖️", "EXPIRED": "⌛",
+    "TP1": "✅", "TP2": "✅", "TP3": "🏆", "CANCELLED": "🚫",
+}
+
+
+def _p(v: float, d: int) -> str:
+    return fmt_price(v, d)
+
+
+# --------------------------------------------------------------------- signal
+def signal_message(sig: Signal, signal_id: int, zone_grade_note: str = "") -> str:
+    d = sig.decimals
+    risk = abs(sig.entry_ref - sig.sl)
+    lines = [
+        f"🎯 <b>SNIPER SIGNAL</b> · {sig.grade} ({sig.zone_score}/100)",
+        f"{ARROW[sig.direction]} <b>{sig.direction}</b> · <b>{esc(sig.symbol)}</b>",
+        "",
+        f"<b>Entry zone</b>  <code>{_p(sig.entry_low, d)} – {_p(sig.entry_high, d)}</code>",
+        f"<b>Stop loss</b>   <code>{_p(sig.sl, d)}</code>  ({fmt_pct(-sig.risk_pct)})",
+        "",
+        f"<b>TP1</b>  <code>{_p(sig.tp1, d)}</code>   ({(abs(sig.tp1 - sig.entry_ref)/risk):.1f}R)",
+        f"<b>TP2</b>  <code>{_p(sig.tp2, d)}</code>   ({(abs(sig.tp2 - sig.entry_ref)/risk):.1f}R)",
+        f"<b>TP3</b>  <code>{_p(sig.tp3, d)}</code>   ({(abs(sig.tp3 - sig.entry_ref)/risk):.1f}R)",
+        "",
+        "<b>Order flow confluence</b>",
+    ]
+    for r in sig.reasons[:8]:
+        lines.append(f"✔️ {esc(r)}")
+
+    kind = "demand" if sig.direction == "LONG" else "supply"
+    fresh = zone_grade_note or ""
+    lines += [
+        "",
+        f"<b>Zone</b> 4H {kind} <code>{_p(sig.zone_low, d)}–{_p(sig.zone_high, d)}</code>{fresh}",
+        f"<b>Confidence</b> {int(sig.confidence*100)}% · <b>R:R</b> {sig.rr:.1f} · <b>Risk</b> {sig.risk_pct*100:.2f}%",
+        f"<code>#{signal_id} · {ts_to_str(sig.created_ts)} UTC</code>",
+    ]
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------- trade alerts
+def tp_alert(trade: dict, level: str, info: dict) -> str:
+    d = trade.get("decimals", 4)
+    price = info.get("price", 0.0)
+    new_stop = info.get("new_stop")
+    lines = [
+        f"{STATUS_ICON.get(level, '✅')} <b>{level} HIT</b> · {esc(trade['symbol'])} {trade['direction']} <code>#{trade['id']}</code>",
+        f"Price <code>{_p(price, d)}</code>  ({info.get('r', 0):+.2f}R)",
+    ]
+    if new_stop:
+        note = "breakeven" if level == "TP1" else "TP1"
+        lines.append(f"🔒 Stop moved to {note}: <code>{_p(new_stop, d)}</code>")
+    if level != "TP3":
+        lines.append("Setup still running.")
+    return "\n".join(lines)
+
+
+def close_alert(trade: dict, status: str, info: dict) -> str:
+    d = trade.get("decimals", 4)
+    price = info.get("price", 0.0)
+    r = info.get("r", 0.0)
+    pct = info.get("pct", 0.0)
+    head = {
+        "WIN": "🏆 <b>SETUP COMPLETE</b>",
+        "LOSS": "🛑 <b>STOP LOSS</b>",
+        "BREAKEVEN": "⚖️ <b>CLOSED AT BREAKEVEN</b>",
+        "EXPIRED": "⌛ <b>SETUP EXPIRED</b>",
+        "CANCELLED": "🚫 <b>SETUP CANCELLED</b>",
+    }.get(status, f"<b>{status}</b>")
+    age = human_delta((time.time() * 1000 - (trade.get("created_ts") or 0)) / 1000)
+    return "\n".join([
+        f"{head} · {esc(trade['symbol'])} {trade['direction']} <code>#{trade['id']}</code>",
+        f"Exit <code>{_p(price, d)}</code> · <b>{r:+.2f}R</b> ({fmt_pct(pct)})",
+        f"Duration {age} · {esc(info.get('reason', ''))}",
+        f"↩️ {esc(trade['symbol'])} back in the watchlist pool.",
+    ])
+
+
+# ------------------------------------------------------------------- reports
+def status_message(engine: dict, trades: List[dict]) -> str:
+    lines = [
+        "📊 <b>ENGINE STATUS</b>",
+        f"Uptime <b>{engine['uptime']}</b> · {'🟢 hunting' if not engine['paused'] else '⏸ paused'}",
+        f"Watchlist <b>{engine['watchlist']}</b> · Zones <b>{engine['zones']}</b> "
+        f"(A+ {engine['a_plus']}) · Armed <b>{engine['armed']}</b>",
+        f"Signals today <b>{engine['signals_today']}</b> · Open <b>{len(trades)}</b>",
+    ]
+    if trades:
+        lines.append("")
+        lines.append("<b>Open setups</b>")
+        for t in trades:
+            d = t.get("decimals", 4)
+            lines.append(
+                f"{ARROW[t['direction']]} <code>#{t['id']}</code> {esc(t['symbol'])} "
+                f"{t['status']} · {t['r_now']:+.2f}R · {_p(t['price'], d)}")
+    else:
+        lines.append("\nNo open setups. Waiting for price to reach a graded zone.")
+    return "\n".join(lines)
+
+
+def active_message(trades: List[dict]) -> str:
+    if not trades:
+        return "No active setups right now."
+    out = ["🎯 <b>ACTIVE SETUPS</b>"]
+    for t in trades:
+        d = t.get("decimals", 4)
+        stop = t.get("sl_current") or t["sl"]
+        out += [
+            "",
+            f"{ARROW[t['direction']]} <b>{esc(t['symbol'])}</b> {t['direction']} <code>#{t['id']}</code> · {t['status']}",
+            f"Entry <code>{_p(t['entry_ref'], d)}</code> · Now <code>{_p(t['price'], d)}</code> "
+            f"(<b>{t['r_now']:+.2f}R</b>)",
+            f"Stop <code>{_p(stop, d)}</code> · TP1 <code>{_p(t['tp1'], d)}</code> · "
+            f"TP2 <code>{_p(t['tp2'], d)}</code> · TP3 <code>{_p(t['tp3'], d)}</code>",
+            f"MFE {t.get('mfe_r') or 0:+.2f}R · MAE {t.get('mae_r') or 0:+.2f}R · age {t['age_h']:.1f}h",
+        ]
+    return "\n".join(out)
+
+
+def watchlist_message(rows: List[dict], threshold: float, next_refresh: str) -> str:
+    if not rows:
+        return "Watchlist is empty."
+    top = rows[:25]
+    lines = [
+        f"👁 <b>WATCHLIST</b> · {len(rows)} symbols above {fmt_usd(threshold)} 24h volume",
+        f"Next rebuild in {next_refresh}",
+        "",
+    ]
+    for i, r in enumerate(top, 1):
+        lines.append(f"{i:>2}. {esc(r['symbol']):<14} {fmt_usd(r['quote_volume'])}")
+    if len(rows) > len(top):
+        lines.append(f"… and {len(rows) - len(top)} more")
+    return "\n".join(lines)
+
+
+def zones_message(symbol: str, rows: List[dict], price: Optional[float] = None) -> str:
+    if not rows:
+        return f"No A/A+ zones stored for {esc(symbol)} right now."
+    lines = [f"🧭 <b>{esc(symbol)} ZONES</b>"]
+    if price:
+        lines.append(f"CMP <code>{price:g}</code>")
+    for z in rows:
+        try:
+            meta = json.loads(z.get("meta") or "{}")
+        except ValueError:
+            meta = {}
+        bd = meta.get("breakdown", {})
+        flags = meta.get("flags", {})
+        icon = "🟩" if z["kind"] == "demand" else "🟥"
+        fresh = "fresh" if z["touches"] == 0 else f"tested {z['touches']}x"
+        lines += [
+            "",
+            f"{icon} <b>{z['grade']} {z['score']}/100</b> · {z['kind']} {z['tf']}",
+            f"<code>{z['low']:g} – {z['high']:g}</code> · {fresh}",
+            f"HTF {bd.get('htf_confluence', 0)} · React {bd.get('reaction', 0)} · "
+            f"Liq {bd.get('liquidity', 0)} · Flow {bd.get('flow_history', 0)} · Fresh {bd.get('freshness', 0)}",
+        ]
+        extras = [k for k in ("mtf_overlap", "sweep_potential", "absorption", "cvd_div") if flags.get(k)]
+        if extras:
+            lines.append("· " + ", ".join(extras))
+    return "\n".join(lines)
+
+
+def signals_message(rows: List[dict]) -> str:
+    if not rows:
+        return "No signals recorded yet."
+    lines = ["🗂 <b>RECENT SIGNALS</b>"]
+    for r in rows:
+        d = r.get("decimals", 4)
+        icon = STATUS_ICON.get(r["status"], "🔵")
+        res = f"{r['result_r']:+.2f}R" if r.get("result_r") is not None else r["status"]
+        lines.append(
+            f"{icon} <code>#{r['id']}</code> {esc(r['symbol'])} {r['direction']} "
+            f"{_p(r['entry_ref'], d)} → {res} · {ts_to_str(r['created_ts'])}")
+    return "\n".join(lines)
+
+
+def pnl_message(perf: dict, period: str, breakdown: List[dict]) -> str:
+    if not perf["closed"]:
+        return f"No closed setups for <b>{period}</b> yet."
+    lines = [
+        f"💰 <b>PERFORMANCE · {period.upper()}</b>",
+        "",
+        f"Closed <b>{perf['closed']}</b> · Wins <b>{perf['wins']}</b> · "
+        f"Losses <b>{perf['losses']}</b> · BE <b>{perf['flat']}</b>",
+        f"Win rate <b>{perf['winrate']:.1f}%</b>",
+        f"Total <b>{perf['total_r']:+.2f}R</b> · Average <b>{perf['avg_r']:+.2f}R</b>",
+        f"TP1 {perf['tp1_hits']} · TP2 {perf['tp2_hits']} · TP3 {perf['tp3_hits']}",
+    ]
+    if perf["best"]:
+        b = perf["best"]
+        lines.append(f"Best <code>#{b['id']}</code> {esc(b['symbol'])} {b['result_r']:+.2f}R")
+    if perf["worst"]:
+        w = perf["worst"]
+        lines.append(f"Worst <code>#{w['id']}</code> {esc(w['symbol'])} {w['result_r']:+.2f}R")
+    if breakdown:
+        lines += ["", "<b>By symbol</b>"]
+        for row in breakdown:
+            lines.append(f"{esc(row['symbol']):<12} {row['n']}x · {(row['r'] or 0):+.2f}R "
+                         f"({row['wins']}W)")
+    lines.append("\n<i>R = multiples of the risk defined by the signal's stop. "
+                 "No position sizing is assumed.</i>")
+    return "\n".join(lines)
+
+
+def report_message(perf: dict, period: str, breakdown: List[dict], engine: dict) -> str:
+    head = pnl_message(perf, period, breakdown)
+    grades: Dict[str, List[float]] = {}
+    for r in perf["rows"]:
+        grades.setdefault(r.get("grade") or "?", []).append(r.get("result_r") or 0.0)
+    extra = ["", "<b>By zone grade</b>"]
+    for g, vals in sorted(grades.items()):
+        wins = len([v for v in vals if v > 0])
+        extra.append(f"{g:<3} {len(vals)}x · {sum(vals):+.2f}R · {wins}/{len(vals)} won")
+    extra += ["", f"<i>Engine uptime {engine['uptime']}, "
+                  f"{engine['signals_total']} signals generated in total.</i>"]
+    return head + "\n" + "\n".join(extra)
+
+
+def stats_message(engine: dict, armed: List[dict]) -> str:
+    lines = [
+        "⚙️ <b>ENGINE INTERNALS</b>",
+        f"Scan cycles <b>{engine['cycles']}</b> · Evaluations <b>{engine['evaluations']}</b>",
+        f"Zones built <b>{engine['zones']}</b> (A+ {engine['a_plus']}, A {engine['a_grade']})",
+        f"Armed now <b>{len(armed)}</b> / {engine['max_armed']} · Rejected setups <b>{engine['rejected']}</b>",
+    ]
+    if engine.get("top_blockers"):
+        lines += ["", "<b>Most common rejections</b>"]
+        for tag, n in engine["top_blockers"]:
+            lines.append(f"· {esc(tag)} — {n}")
+    if armed:
+        lines += ["", "<b>Currently armed</b>"]
+        for a in armed:
+            lines.append(
+                f"{esc(a['symbol'])} {a['direction']} · zone {a['score']} · "
+                f"{a['trades']} trades · {a['age_min']}m")
+            if a["blockers"]:
+                lines.append("   waiting on: " + esc(", ".join(a["blockers"])))
+    return "\n".join(lines)
+
+
+def health_message(h: dict) -> str:
+    return "\n".join([
+        "🩺 <b>SYSTEM HEALTH</b>",
+        f"Uptime <b>{h['uptime']}</b> · Memory <b>{h['rss_mb']:.0f} MB</b>",
+        f"REST weight <b>{h['weight_used']}/{h['weight_budget']}</b> per minute "
+        f"(exchange reports {h['weight_reported']})",
+        f"Mark-price stream {'🟢' if h['markprice_ok'] else '🔴'} "
+        f"({h['markprice_symbols']} symbols, {h['markprice_age']:.0f}s ago)",
+        f"Flow streams <b>{h['flow_streams']}</b> · reconnects <b>{h['reconnects']}</b>",
+        f"Database <code>{esc(h['db_path'])}</code> · {h['db_size_mb']:.1f} MB",
+        f"Tasks alive <b>{h['tasks']}</b> · Telegram messages sent <b>{h['tg_sent']}</b>",
+    ])
+
+
+def help_message() -> str:
+    return "\n".join([
+        "🤖 <b>SNIPER FLOW</b> — order-flow signal engine",
+        "",
+        "<b>/status</b> — engine + open setups",
+        "<b>/active</b> — detailed open setups",
+        "<b>/watchlist</b> — volume-filtered universe",
+        "<b>/zones SYMBOL</b> — graded S/R zones",
+        "<b>/signals [n]</b> — recent signals",
+        "<b>/pnl [today|week|month|all]</b> — performance",
+        "<b>/report [period]</b> — full report",
+        "<b>/stats</b> — internals, armed symbols, rejection reasons",
+        "<b>/health</b> — connections, rate limit, memory",
+        "<b>/close ID</b> — force-close a setup at market",
+        "<b>/pause</b> · <b>/resume</b> — signal generation",
+        "",
+        "<i>Analysis and alerts only. No orders are ever placed.</i>",
+    ])
+
+
+def startup_message(engine: dict, bot_name: str) -> str:
+    return "\n".join([
+        "🚀 <b>SNIPER FLOW ONLINE</b>",
+        f"Bot {esc(bot_name)}",
+        f"Watchlist <b>{engine['watchlist']}</b> symbols · "
+        f"volume filter {fmt_usd(engine['min_volume'])}",
+        f"Zone refresh every {engine['zone_refresh']}h · "
+        f"proximity scan every {engine['proximity']}s",
+        "Send /help for commands.",
+    ])
