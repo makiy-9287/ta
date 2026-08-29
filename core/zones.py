@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from .indicators import atr, cvd_divergence, find_pivots, range_position
+from .liquidity import LiquidityMap, StructuralLevel
 from .models import Candle, Zone
 from .utils import get_logger, median, overlap, percentile
 
@@ -120,6 +121,72 @@ def detect_zones(ctx: ZoneContext, symbol: str, tf: str, cfg) -> List[Zone]:
     return out
 
 
+def structural_zones(liq: LiquidityMap, symbol: str, tf: str, ctx: ZoneContext,
+                     cfg) -> List[Zone]:
+    """
+    Turn major swing points into zones.
+
+    A prior HH, HL, LL or LH is a support/resistance level in its own right:
+    price reversed there, so orders rest there. Those are precisely the pockets
+    institutions drive price into - through the level to trigger the cluster,
+    then away. Pivot clustering alone misses the isolated but structurally
+    decisive swing, so we add them explicitly.
+    """
+    out: List[Zone] = []
+    min_w = ctx.atr * cfg.zone_min_atr_width
+    candles = ctx.candles
+
+    for level in liq.highs + liq.lows:
+        if level.label not in ("HH", "HL", "LH", "LL"):
+            continue
+        if level.strength < cfg.structural_min_strength:
+            continue
+        if level.index >= len(candles):
+            continue
+        c = candles[level.index]
+        kind = "demand" if level.kind == "low" else "supply"
+        if kind == "demand":
+            lo, hi = c.low, max(c.body_low, c.low + min_w)
+        else:
+            hi, lo = c.high, min(c.body_high, c.high - min_w)
+        if hi - lo < min_w:
+            pad = (min_w - (hi - lo)) / 2
+            lo, hi = lo - pad, hi + pad
+
+        out.append(Zone(
+            symbol=symbol, kind=kind, tf=tf, low=lo, high=hi,
+            created_ts=c.ts, members=level.equal_count,
+            flags={"formation_idx": level.index, "first_idx": level.index,
+                   "structural": level.label, "structural_strength": level.strength,
+                   "swept": level.swept, "source": "structure"},
+        ))
+    return out
+
+
+def absorb_structural(pivot_zones: List[Zone], structural: List[Zone]) -> List[Zone]:
+    """
+    Fold structural levels into the zone map without distorting it.
+
+    When a labelled swing sits inside a zone the clustering already found, they
+    describe the same level - so the existing box is *tagged* rather than
+    widened. Widening it would inflate the touch count and wrongly age a fresh
+    zone. Only structurally decisive swings that clustering missed entirely are
+    added as new zones.
+    """
+    out = list(pivot_zones)
+    for s in structural:
+        twin = next((z for z in out if z.kind == s.kind and z.overlaps(s)), None)
+        if twin is not None:
+            twin.flags.setdefault("structural", s.flags.get("structural"))
+            twin.flags["structural_strength"] = max(
+                float(twin.flags.get("structural_strength") or 0),
+                float(s.flags.get("structural_strength") or 0))
+            twin.members = max(twin.members, s.members)
+            continue
+        out.append(s)
+    return out
+
+
 def _merge_overlaps(zones: List[Zone]) -> List[Zone]:
     """Fold zones that overlap heavily into one box (keeps the map readable)."""
     merged: List[Zone] = []
@@ -202,6 +269,42 @@ def _score_reaction(zone: Zone, ctx: ZoneContext) -> Tuple[int, Dict[str, bool]]
         if move >= 1.6 * ctx.atr or impulsive:
             flags["displacement"] = True
             pts += 10
+    return pts, flags
+
+
+def _score_liquidity_map(zone: Zone, ctx: ZoneContext, liq: LiquidityMap
+                         ) -> Tuple[int, Dict[str, object]]:
+    """
+    C. Liquidity - 20 pts, judged against the structural map.
+
+    swing/structural level in front  +5
+    equal highs or lows              +5
+    untapped liquidity to sweep     +10
+    """
+    pts = 0
+    flags: Dict[str, object] = {"swing_in_front": False, "equal_levels": False,
+                                "sweep_potential": False, "front_label": ""}
+    reach = 2.5 * ctx.atr
+    if zone.kind == "demand":
+        near = [l for l in liq.lows if zone.low - reach <= l.price <= zone.high + reach * 0.4]
+    else:
+        near = [l for l in liq.highs if zone.low - reach * 0.4 <= l.price <= zone.high + reach]
+
+    if near:
+        flags["swing_in_front"] = True
+        best = max(near, key=lambda l: l.strength)
+        flags["front_label"] = best.label
+        pts += 5
+
+    if any(l.equal_count >= 2 for l in near):
+        flags["equal_levels"] = True
+        pts += 5
+
+    untapped = [l for l in near if not l.swept]
+    if untapped:
+        flags["sweep_potential"] = True
+        flags["untapped_level"] = round(max(untapped, key=lambda l: l.strength).price, 10)
+        pts += 10
     return pts, flags
 
 
@@ -295,12 +398,14 @@ def _score_flow_history(zone: Zone, ctx: ZoneContext) -> Tuple[int, Dict[str, bo
     return pts, flags
 
 
-def score_zone(zone: Zone, ctx: ZoneContext, mtf_zones: List[Zone], cfg) -> Zone:
+def score_zone(zone: Zone, ctx: ZoneContext, mtf_zones: List[Zone], cfg,
+               liq: Optional[LiquidityMap] = None) -> Zone:
     breakdown: Dict[str, int] = {}
     flags: Dict[str, object] = dict(zone.flags)
 
     # --- A. higher-timeframe confluence (30) -------------------------------
-    major = zone.members >= 2
+    structural = zone.flags.get("structural")
+    major = zone.members >= 2 or bool(structural)
     a_pts = 20 if major else 12
     flags["htf_major"] = major
     mtf_hit = any(z.kind == zone.kind and z.overlaps(zone) for z in mtf_zones)
@@ -315,7 +420,10 @@ def score_zone(zone: Zone, ctx: ZoneContext, mtf_zones: List[Zone], cfg) -> Zone
     flags.update(b_flags)
 
     # --- C. liquidity (20) --------------------------------------------------
-    c_pts, c_flags = _score_liquidity(zone, ctx)
+    if liq is not None:
+        c_pts, c_flags = _score_liquidity_map(zone, ctx, liq)
+    else:
+        c_pts, c_flags = _score_liquidity(zone, ctx)
     breakdown["liquidity"] = c_pts
     flags.update(c_flags)
 
@@ -343,6 +451,7 @@ def score_zone(zone: Zone, ctx: ZoneContext, mtf_zones: List[Zone], cfg) -> Zone
 class ZoneEngine:
     def __init__(self, cfg):
         self.cfg = cfg
+        self.last_liquidity: Optional[LiquidityMap] = None
 
     def build(self, symbol: str, htf: Sequence[Candle], mtf: Sequence[Candle]) -> List[Zone]:
         cfg = self.cfg
@@ -352,13 +461,18 @@ class ZoneEngine:
         htf_ctx = build_context(htf, cfg.pivot_left, cfg.pivot_right)
         mtf_ctx = build_context(mtf, cfg.pivot_left, cfg.pivot_right) if len(mtf) >= 80 else None
 
-        htf_zones = _merge_overlaps(detect_zones(htf_ctx, symbol, cfg.htf_interval, cfg))
+        htf_liq = LiquidityMap(htf, left=cfg.pivot_left, right=cfg.pivot_right,
+                               equal_tol_atr=cfg.equal_level_atr_tol)
+        self.last_liquidity = htf_liq
+        pivot_zones = _merge_overlaps(detect_zones(htf_ctx, symbol, cfg.htf_interval, cfg))
+        htf_zones = absorb_structural(
+            pivot_zones, structural_zones(htf_liq, symbol, cfg.htf_interval, htf_ctx, cfg))
         mtf_zones = _merge_overlaps(detect_zones(mtf_ctx, symbol, cfg.mtf_interval, cfg)) if mtf_ctx else []
 
         price = htf[-1].close
         scored: List[Zone] = []
         for z in htf_zones:
-            z = score_zone(z, htf_ctx, mtf_zones, cfg)
+            z = score_zone(z, htf_ctx, mtf_zones, cfg, liq=htf_liq)
 
             if z.flags.get("broken"):
                 continue

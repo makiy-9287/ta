@@ -23,28 +23,64 @@ def _p(v: float, d: int) -> str:
 def signal_message(sig: Signal, signal_id: int, zone_grade_note: str = "") -> str:
     d = sig.decimals
     risk = abs(sig.entry_ref - sig.sl)
+    meta = sig.meta or {}
+    targets = {round(float(t["price"]), 10): t for t in (meta.get("targets") or [])}
+
+    def target_note(level: float) -> str:
+        t = targets.get(round(level, 10))
+        if not t:
+            return ""
+        label = t.get("label") or t.get("source")
+        return f"  <i>{esc(str(label))}</i>"
+
     lines = [
         f"🎯 <b>SNIPER SIGNAL</b> · {sig.grade} ({sig.zone_score}/100)",
-        f"{ARROW[sig.direction]} <b>{sig.direction}</b> · <b>{esc(sig.symbol)}</b>",
+        f"{ARROW[sig.direction]} <b>{sig.direction}</b> · <b>{esc(sig.symbol)}</b>"
+        f"  <code>{esc(str(meta.get('exchange', '')))}</code>",
         "",
         f"<b>Entry zone</b>  <code>{_p(sig.entry_low, d)} – {_p(sig.entry_high, d)}</code>",
         f"<b>Stop loss</b>   <code>{_p(sig.sl, d)}</code>  ({fmt_pct(-sig.risk_pct)})",
+    ]
+    age = meta.get("sweep_age_bars")
+    if age is not None:
+        lines.append(f"<i>stop sits beyond the sweep wick from {age} bars ago</i>")
+    lines += [
         "",
-        f"<b>TP1</b>  <code>{_p(sig.tp1, d)}</code>   ({(abs(sig.tp1 - sig.entry_ref)/risk):.1f}R)",
-        f"<b>TP2</b>  <code>{_p(sig.tp2, d)}</code>   ({(abs(sig.tp2 - sig.entry_ref)/risk):.1f}R)",
-        f"<b>TP3</b>  <code>{_p(sig.tp3, d)}</code>   ({(abs(sig.tp3 - sig.entry_ref)/risk):.1f}R)",
+        f"<b>TP1</b>  <code>{_p(sig.tp1, d)}</code>  ({(abs(sig.tp1 - sig.entry_ref)/risk):.1f}R){target_note(sig.tp1)}",
+        f"<b>TP2</b>  <code>{_p(sig.tp2, d)}</code>  ({(abs(sig.tp2 - sig.entry_ref)/risk):.1f}R){target_note(sig.tp2)}",
+        f"<b>TP3</b>  <code>{_p(sig.tp3, d)}</code>  ({(abs(sig.tp3 - sig.entry_ref)/risk):.1f}R){target_note(sig.tp3)}",
         "",
         "<b>Order flow confluence</b>",
     ]
-    for r in sig.reasons[:8]:
+    for r in sig.reasons[:9]:
         lines.append(f"✔️ {esc(r)}")
 
+    # institutional participation
+    ex = meta.get("execution") or {}
+    ice = ex.get("iceberg") or {}
+    slic = ex.get("slicing") or {}
+    inst = []
+    if ex.get("supportive_iceberg"):
+        inst.append(f"iceberg {ice.get('ratio')}x displayed at {_p(float(ice.get('price') or 0), d)}")
+    if slic.get("twap"):
+        inst.append(f"TWAP {slic.get('count')}x{slic.get('clip')} clips")
+    if inst:
+        lines += ["", f"🏛 <b>Institutional</b>: {esc(', '.join(inst))}"]
+
+    bias = meta.get("liquidity_bias") or {}
+    heat = meta.get("heatmap") or {}
+    if bias.get("bias"):
+        lines.append(f"💧 <b>Liquidity</b> resting {esc(str(bias['bias']))} "
+                     f"(ratio {bias.get('ratio')}) · heatmap imbalance {heat.get('imbalance')}")
+
     kind = "demand" if sig.direction == "LONG" else "supply"
-    fresh = zone_grade_note or ""
+    label = meta.get("zone_label")
+    label_txt = f" [{esc(str(label))}]" if label else ""
     lines += [
-        "",
-        f"<b>Zone</b> 4H {kind} <code>{_p(sig.zone_low, d)}–{_p(sig.zone_high, d)}</code>{fresh}",
-        f"<b>Confidence</b> {int(sig.confidence*100)}% · <b>R:R</b> {sig.rr:.1f} · <b>Risk</b> {sig.risk_pct*100:.2f}%",
+        f"🧭 <b>Zone</b> 4H {kind}{label_txt} "
+        f"<code>{_p(sig.zone_low, d)}–{_p(sig.zone_high, d)}</code>{zone_grade_note}",
+        f"<b>Confidence</b> {int(sig.confidence*100)}% · <b>R:R</b> {sig.rr:.1f} · "
+        f"<b>Risk</b> {sig.risk_pct*100:.2f}%",
         f"<code>#{signal_id} · {ts_to_str(sig.created_ts)} UTC</code>",
     ]
     return "\n".join(lines)
@@ -95,6 +131,8 @@ def status_message(engine: dict, trades: List[dict]) -> str:
         f"Uptime <b>{engine['uptime']}</b> · {'🟢 hunting' if not engine['paused'] else '⏸ paused'}",
         f"Watchlist <b>{engine['watchlist']}</b> · Zones <b>{engine['zones']}</b> "
         f"(A+ {engine['a_plus']}) · Armed <b>{engine['armed']}</b>",
+        "Feeds: " + " · ".join(f"{esc(k)} {v}" for k, v in
+                               (engine.get("exchanges") or {}).items()),
         f"Signals today <b>{engine['signals_today']}</b> · Open <b>{len(trades)}</b>",
     ]
     if trades:
@@ -243,10 +281,12 @@ def stats_message(engine: dict, armed: List[dict]) -> str:
     if armed:
         lines += ["", "<b>Currently armed</b>"]
         for a in armed:
+            venue = f" [{esc(a.get('exchange', ''))}]"
+            inst = " 🏛" if a.get("institutional") else ""
             feed = f" · feed {a['feed_age']}s" if a.get("feed_age", 0) > 60 else ""
             polls = f" · {a['rest_polls']} REST polls" if a.get("rest_polls") else ""
             lines.append(
-                f"{esc(a['symbol'])} {a['direction']} · zone {a['score']} · "
+                f"{esc(a['symbol'])}{venue}{inst} {a['direction']} · zone {a['score']} · "
                 f"{a['trades']} trades · {a['age_min']}m{feed}{polls}")
             if a["blockers"]:
                 lines.append("   waiting on: " + esc(", ".join(a["blockers"])))
@@ -257,28 +297,36 @@ def health_message(h: dict) -> str:
     lines = [
         "🩺 <b>SYSTEM HEALTH</b>",
         f"Uptime <b>{h['uptime']}</b> · Memory <b>{h['rss_mb']:.0f} MB</b>",
-        f"REST weight <b>{h['weight_used']}/{h['weight_budget']}</b> per minute "
-        f"(exchange reports {h['weight_reported']})",
     ]
-    if h.get("penalty_sec"):
-        lines.append(f"⚠️ Rate-limit penalty active for {h['penalty_sec']}s")
+    for venue, v in (h.get("venues") or {}).items():
+        pen = f" · ⚠️ penalty {v['penalty']}s" if v.get("penalty") else ""
+        lines.append(f"· <b>{esc(venue)}</b> budget {v['used']}/{v['budget']}{pen}")
 
+    assign = h.get("assignment") or {}
+    if assign:
+        lines.append("Stream split: " + " · ".join(
+            f"<b>{esc(k)}</b> {v}" for k, v in assign.items()))
+
+    feed = h.get("feed") or {}
     lines += [
+        f"Feed queue <b>{feed.get('pending', 0)}</b> pending · "
+        f"{feed.get('processed', 0)} processed · <b>{feed.get('dropped', 0)}</b> dropped",
+        f"Event lag <b>{feed.get('lag_ms', 0)} ms</b> (peak {feed.get('max_lag_ms', 0)} ms)",
         f"Mark-price stream {'🟢' if h['markprice_ok'] else '🔴'} "
-        f"({h['markprice_symbols']} symbols, {esc(h['markprice_age'])})",
-        f"Price source <b>{esc(h['price_source'])}</b>"
-        + (f" · {h['rest_price_symbols']} symbols cached" if h['price_source'] == "rest" else ""),
+        f"({h['markprice_symbols']} symbols, {esc(str(h['markprice_age']))})",
+        f"Price source <b>{esc(h['price_source'])}</b> · {h['price_symbols']} symbols",
         f"Flow streams <b>{h['flow_streams']}</b> · reconnects <b>{h['reconnects']}</b>"
         + (f" · <b>{h['silent_sockets']}</b> silent" if h.get("silent_sockets") else ""),
     ]
     if h.get("rest_polls"):
         lines.append(f"REST flow polls <b>{h['rest_polls']}</b> (websocket feed degraded)")
-
     lines += [
         f"Database <code>{esc(h['db_path'])}</code> · {h['db_size_mb']:.1f} MB",
         f"Tasks alive <b>{h['tasks']}</b> · Telegram messages sent <b>{h['tg_sent']}</b>",
     ]
-
+    if feed.get("dropped", 0) > 0:
+        lines += ["", "<i>Dropped events mean a queue filled faster than it drained. "
+                      "Reduce MAX_ARMED_SYMBOLS or raise QUEUE_MAXSIZE.</i>"]
     if not h["markprice_ok"]:
         lines += ["", "<i>The websocket feed is not delivering data. The engine "
                       "is running on REST polling - signals still work, but flow "
@@ -312,6 +360,8 @@ def startup_message(engine: dict, bot_name: str) -> str:
         f"Bot {esc(bot_name)}",
         f"Watchlist <b>{engine['watchlist']}</b> symbols · "
         f"volume filter {fmt_usd(engine['min_volume'])}",
+        "Feeds: " + " · ".join(f"{esc(k)} {v}" for k, v in
+                               (engine.get("exchanges") or {}).items()),
         f"Zone refresh every {engine['zone_refresh']}h · "
         f"proximity scan every {engine['proximity']}s",
         "Send /help for commands.",

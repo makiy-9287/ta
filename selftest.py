@@ -25,7 +25,11 @@ from typing import List, Tuple
 
 from config import SETTINGS
 from core.armed import ArmedContext
-from core.confirm import evaluate
+from core.confirm import evaluate, liquidity_targets
+from core.events import DepthEvent, TradeEvent
+from core.execution_algos import detect_iceberg, detect_slicing, session_vwap
+from core.heatmap import LiquidityHeatmap
+from core.liquidity import LiquidityMap
 from core.database import Database
 from core.indicators import atr, cvd_divergence, htf_trend
 from core.models import Candle
@@ -122,7 +126,7 @@ def build_ltf(zone, interval_ms: int, bars: int) -> List[Candle]:
         (hi + 1.1 * h, lo + 0.30 * h, 0.22),  # into the zone -> prior swing low
         (lo + 0.30 * h, lo + 0.85 * h, 0.11), # weak bounce
         (lo + 0.85 * h, lo - 0.22 * h, 0.15), # THE SWEEP
-        (lo - 0.22 * h, hi + 0.45 * h, 0.11), # reclaim + structure shift
+        (lo - 0.22 * h, hi + 0.45 * h, 0.06), # reclaim: only a few bars ago
     ]
     total = sum(w for *_, w in legs)
     ts = 1_700_000_000_000
@@ -173,59 +177,87 @@ def build_micro_cvd(zone, bars: int = 110) -> List[Candle]:
     return out
 
 
-def build_agg_trades(zone, ctx_ts: int) -> List[dict]:
+def build_agg_trades(zone, ctx_ts: int) -> List[TradeEvent]:
     """
-    Order flow for the sweep window: a wall of aggressive selling into the
-    lows that the market absorbs, then an aggressive buy-driven reclaim.
+    Order flow for the sweep window.
+
+    Deliberately contains an institutional signature: a passive bid absorbing
+    a flush at the lows, refilled in uniform clips at regular intervals - the
+    footprint of an iceberg being worked, not a momentary spike.
     """
     lo, hi, h = zone.low, zone.high, zone.height
     sweep_low = lo - 0.22 * h
     reclaim = hi + 0.45 * h
     step = max(0.01, round(h * 0.05, 4))
-    trades: List[dict] = []
+    trades: List[TradeEvent] = []
     ts = ctx_ts - 22 * 60 * 1000
 
-    def push(price: float, qty: float, maker_buy: bool, gap: int = 900):
+    def push(price: float, qty: float, buy: bool, gap: int = 900):
         nonlocal ts
-        trades.append({"p": f"{price:.4f}", "q": f"{qty:.3f}", "m": maker_buy, "T": ts})
+        trades.append(TradeEvent("binance", "TESTUSDT", round(price, 6),
+                                 round(qty, 4), buy, ts, len(trades) + 1))
         ts += gap
 
     for i in range(120):                                   # descent
-        push(lo + 0.85 * h - i * (h * 0.009), random.uniform(1, 3), True)
-    for i in range(320):                                   # the flush, absorbed
+        push(lo + 0.85 * h - i * (h * 0.009), random.uniform(1, 3), False)
+
+    # the flush, absorbed at the lows - aggressive sells hitting a passive bid
+    for i in range(320):
         price = sweep_low + random.choice([0, 1, 2, 3, 4]) * step
-        push(price, random.uniform(9, 18), True, 400)
+        push(price, random.uniform(9, 18), False, 400)
         if i % 5 == 0:
-            push(price + step, random.uniform(1.5, 3), False, 200)
+            push(price + step, random.uniform(1.5, 3), True, 200)
+
+    # the institutional tell: identical clips at metronomic intervals.
+    # 5.0 is chosen so no other leg of this fixture can produce it, making the
+    # assertion about the detector rather than about the random seed.
+    for i in range(26):
+        push(sweep_low + step, 5.0, True, 3000)
+
     price = sweep_low + 2 * step                           # the reclaim
     while price < reclaim:
         for _ in range(9):
-            push(price, random.uniform(4, 9), False, 250)
-        push(price - step * 0.2, random.uniform(0.2, 0.5), True, 120)
+            push(price, random.uniform(6.2, 9.0), True, 250)
+        push(price - step * 0.2, random.uniform(0.2, 0.5), False, 120)
         price += step * 1.4
     for _ in range(40):
-        push(reclaim, random.uniform(2, 5), False, 300)
+        push(reclaim, random.uniform(2, 5), True, 300)
     return trades
 
 
-def feed_depth(ctx: ArmedContext, zone, ts: int) -> None:
-    """A real bid wall that gets touched and eaten - order book 'case B'."""
-    lo, h = zone.low, zone.height
+def feed_depth(ctx, zone, ts: int) -> None:
+    """
+    A real bid wall that is touched, eaten and refilled - order book case B,
+    and the heatmap shelf a long leans on. Also seeds an ask-side pool above
+    for the targets to aim at.
+    """
+    lo, hi, h = zone.low, zone.high, zone.height
     wall_price = lo - 0.10 * h
-    for i in range(28):
-        mid = (lo + 0.85 * h) - i * (h * 0.05) if i < 20 else wall_price + (i - 20) * (h * 0.12)
-        wall_qty = 900.0 if i < 12 else max(60.0, 900.0 - (i - 11) * 110.0)
-        bids = [[f"{wall_price:.4f}", f"{wall_qty:.2f}"]] + [
-            [f"{mid - h * 0.02 * (k + 1):.4f}", f"{random.uniform(40, 90):.2f}"] for k in range(19)]
-        asks = [[f"{mid + h * 0.02 * (k + 1):.4f}", f"{random.uniform(25, 55):.2f}"] for k in range(20)]
-        ctx.depth.update(bids, asks, ts + i * 500)
+    target_price = hi + 1.6 * h
+    for i in range(60):
+        mid = (lo + 0.85 * h) - i * (h * 0.03) if i < 20 else wall_price + (i - 20) * (h * 0.05)
+        # the wall is consumed, then refilled: an iceberg working the level
+        wall_qty = 900.0 if i < 12 else (max(80.0, 900.0 - (i - 11) * 90.0) if i < 22 else 780.0)
+        bids = sorted([(round(wall_price, 6), wall_qty)] + [
+            (round(mid - h * 0.02 * (k + 1), 6), random.uniform(40, 90)) for k in range(19)],
+            key=lambda x: -x[0])
+        asks = sorted([(round(target_price, 6), 850.0)] + [
+            (round(mid + h * 0.02 * (k + 1), 6), random.uniform(25, 55)) for k in range(19)],
+            key=lambda x: x[0])
+        ev = DepthEvent("binance", "TESTUSDT", bids, asks, ts + i * 1000)
+        ctx.on_depth(ev)
 
 
 # ---------------------------------------------------------------------- tests
+HTF_LIQUIDITY = None
+
+
 def test_zones() -> Tuple[bool, object]:
+    global HTF_LIQUIDITY
     htf, mtf = build_htf(), build_mtf()
     engine = ZoneEngine(SETTINGS)
     zones = engine.build("TESTUSDT", htf, mtf)
+    HTF_LIQUIDITY = engine.last_liquidity
     demand = [z for z in zones if z.kind == "demand"]
 
     check("4H/1H candle series built", len(htf) > 200 and len(mtf) > 200,
@@ -244,6 +276,9 @@ def test_zones() -> Tuple[bool, object]:
     check("liquidity scored", best.breakdown.get("liquidity", 0) >= 10,
           str(best.breakdown.get("liquidity")))
     check("score never exceeds 100", best.score <= 100, str(best.score))
+    check("structural label attached to the zone",
+          bool(best.flags.get("structural")) or best.breakdown.get("liquidity", 0) >= 10,
+          f"label={best.flags.get('structural')}")
     check("4H trend classified", htf_trend(htf)["state"] in
           ("strong_up", "up", "range", "down", "strong_down"), str(htf_trend(htf)["state"]))
     return True, best
@@ -253,10 +288,17 @@ def test_structure(zone) -> bool:
     slow = build_ltf(zone, 5 * 60_000, 90)
     fast = build_ltf(zone, 3 * 60_000, 120)
     a = atr(slow, 14)
-    sweep = detect_sweep(slow, "LONG", SETTINGS, zone=zone, atr_val=a)
+    liq = LiquidityMap(slow, 2, 2, SETTINGS.equal_level_atr_tol)
+    sweep = detect_sweep(slow, "LONG", SETTINGS, zone=zone, atr_val=a, liquidity=liq)
     ok = check("liquidity sweep detected on 5m", bool(sweep.get("found")),
                f"level {sweep.get('level', 0):.3f}, extreme {sweep.get('extreme', 0):.3f}")
     ok &= check("swept level reclaimed", bool(sweep.get("reclaimed")))
+    ok &= check("sweep is recent (within the strict window)",
+                int(sweep.get("age_bars", 99)) <= SETTINGS.sweep_max_age_bars,
+                f"{sweep.get('age_bars')} bars ago, max {SETTINGS.sweep_max_age_bars}")
+    ok &= check("sweep took out a structural level",
+                bool(sweep.get("structural")),
+                str((sweep.get("structural") or {}).get("label")))
     mss = detect_mss(fast, "LONG", SETTINGS)
     ok &= check("market structure shift on 3m", bool(mss.get("found")),
                 f"broke {mss.get('level', 0):.3f}")
@@ -275,15 +317,20 @@ def test_orderflow(zone) -> Tuple[bool, ArmedContext]:
                        ref_price=zone.mid)
     # fixed, bucket-aligned anchor: the test must not depend on the wall clock
     now = 1_700_003_600_000
-    ctx.book.seed_from_rest(build_agg_trades(zone, now))
+    trades = build_agg_trades(zone, now)
+    ctx.book.seed_from_events(trades)
+    for t in trades:
+        ctx.heatmap.note_execution(t.price, t.qty, t.buy)
     feed_depth(ctx, zone, now)
     ctx.candles[SETTINGS.micro_interval] = build_micro_cvd(zone)
     ctx.candles[SETTINGS.ltf_fast] = build_ltf(zone, 3 * 60_000, 120)
     ctx.candles[SETTINGS.ltf_slow] = build_ltf(zone, 5 * 60_000, 90)
+    ctx.candles[SETTINGS.ltf_mid] = build_ltf(zone, 15 * 60_000, 90)
     ctx.armed_at = time.time() - 600
     ctx.seeded = True
     ctx.last_event_ts = time.time()      # the fixture stands in for a live feed
     ctx.last_flow_ts = time.time()
+    ctx.refresh_derived(force=True)
 
     health = ctx.book.health(SETTINGS.min_trades_for_flow)
     check("footprint populated", health["enough"],
@@ -303,7 +350,7 @@ def test_orderflow(zone) -> Tuple[bool, ArmedContext]:
           f"stack {imb['buy_stack']}, count {imb['buy_count']}")
 
     ob = ctx.depth.analyse("LONG", zone.mid, SETTINGS)
-    check("order book wall consumed, not pulled (case B)",
+    check("order book wall consumed or refilled, not pulled (case B)",
           ob["walls"]["case_b"] and not ob["liquidity_pulling"],
           f"{ob['walls']['biggest']}")
     return True, ctx
@@ -457,6 +504,20 @@ async def _test_resilience(zone) -> bool:
                 bulk_blocked and priority_ok,
                 f"bulk cap {lim4.bulk_budget} of {lim4.budget}")
 
+    # 2d. one corrupt timestamp must not be able to wipe the footprint book
+    from core.orderflow import FootprintBook
+    fb = FootprintBook(0.01, 100.0, 60, 90, 60)
+    base = 1_700_000_000_000
+    for i in range(400):
+        fb.add(100 + i * 0.001, 2, i % 3 != 0, base + i * 1000)
+    intact = fb.total_trades
+    fb.add(100.5, 1, True, 1_900_000_000_000)     # clock-skewed far future
+    fb.add(100.5, 1, True, 1_700_000_000)         # seconds where ms expected
+    fb.add(100.5, 1, True, base + 401_000)        # legitimate next print
+    ok &= check("corrupt timestamps rejected without destroying the book",
+                intact == 400 and fb.total_trades == 401 and fb.rejected_ts == 2,
+                f"{fb.total_trades} trades kept, {fb.rejected_ts} rejected")
+
     # 3. a silent socket must be detected rather than treated as healthy
     from core.ws import MarkPriceStream
     st = MarkPriceStream("wss://example.invalid", idle_timeout=2)
@@ -472,15 +533,20 @@ async def _test_resilience(zone) -> bool:
     ctx.last_flow_ts = time.time() - 900
     stale_before = ctx.flow_age
 
-    class _StubREST:
-        async def agg_trades(self, s, l):
-            return build_agg_trades(zone, 1_700_003_600_000)
-        async def klines(self, s, i, l):
-            return build_ltf(zone, 60_000, 120)
-        async def depth(self, s, l):
-            return {"bids": [["1", "5"]], "asks": [["2", "5"]]}
+    class _StubAdapter:
+        name = "stub"
 
-    await ctx.poll_rest(_StubREST())
+        async def recent_trades(self, s, l=1000):
+            return build_agg_trades(zone, 1_700_003_600_000)
+
+        async def klines(self, s, i, l, bulk=False):
+            return build_ltf(zone, 60_000, 120)
+
+        async def depth(self, s, l=50):
+            return DepthEvent("stub", s, [(1.0, 5.0)], [(2.0, 5.0)], 1_700_003_600_000)
+
+    stub = _StubAdapter()
+    await ctx.poll_rest(stub, stub)
     ok &= check("REST fallback revives a dead order-flow feed",
                 stale_before > 800 and ctx.flow_age < 5 and ctx.book.total_trades > 0,
                 f"flow age {stale_before:.0f}s -> {ctx.flow_age:.1f}s, "
@@ -500,6 +566,157 @@ async def _test_resilience(zone) -> bool:
     await asyncio.wait_for(bot._dispatch(_never_returns, "status", []), timeout=5)
     ok &= check("hung command times out instead of silencing the bot",
                 bool(delivered) and "timed out" in delivered[0])
+    return ok
+
+
+async def _test_multi_exchange() -> bool:
+    """Venue dialects must arrive downstream as one identical event model."""
+    from core.exchanges.binance import BinanceStreamSession
+    from core.exchanges.bybit import BybitStreamSession
+    from core.feed import EventBus, PriceBook, SymbolRouter
+
+    bn = BinanceStreamSession("wss://x", "BTCUSDT", ["1m", "5m"], 20, 500)
+    by = BybitStreamSession("wss://y", "BTCUSDT", ["1m", "5m"], 20, 500)
+
+    # Binance flags the MAKER side, Bybit flags the TAKER side. Both of these
+    # describe the same event: an aggressive SELL.
+    b_ev = bn.handle({"data": {"e": "aggTrade", "p": "100", "q": "2",
+                               "m": True, "T": 1, "a": 5}})[0]
+    y_ev = by.handle({"topic": "publicTrade.BTCUSDT", "ts": 1,
+                      "data": [{"T": 1, "S": "Sell", "v": "2", "p": "100", "i": "5"}]})[0]
+    ok = check("opposite venue side conventions normalise identically",
+               b_ev.buy is False and y_ev.buy is False and b_ev.qty == y_ev.qty,
+               f"binance buy={b_ev.buy}, bybit buy={y_ev.buy}")
+
+    by.handle({"topic": "orderbook.50.BTCUSDT", "type": "snapshot", "ts": 1000,
+               "data": {"b": [["99", "5"], ["98", "3"]], "a": [["101", "4"]]}})
+    d = by.handle({"topic": "orderbook.50.BTCUSDT", "type": "delta", "ts": 2000,
+                   "data": {"b": [["99", "0"], ["97", "9"]], "a": []}})
+    ok &= check("bybit delta book reconstructs into full snapshots",
+                bool(d) and d[0].bids == [(98.0, 3.0), (97.0, 9.0)],
+                str(d[0].bids if d else None))
+    ok &= check("bybit depth stream is throttled",
+                by.handle({"topic": "orderbook.50.BTCUSDT", "type": "delta", "ts": 2100,
+                           "data": {"b": [["96", "1"]], "a": []}}) == [])
+
+    k = by.handle({"topic": "kline.5.BTCUSDT", "ts": 1, "data": [
+        {"start": "1000", "end": "2000", "interval": "5", "open": "1", "high": "2",
+         "low": "0.5", "close": "1.5", "volume": "10", "turnover": "15", "confirm": True}]})
+    ok &= check("bybit intervals map to canonical notation",
+                k[0].interval == "5m" and k[0].closed, k[0].interval)
+
+    # 50/50 split, honouring single-venue listings
+    router = SymbolRouter(SETTINGS)
+    common = {f"C{i}" for i in range(100)}
+    listings = {"binance": common | {"ONLYB"}, "bybit": common | {"ONLYY"}}
+    plan = router.plan([f"C{i}" for i in range(100)] + ["ONLYB", "ONLYY"],
+                       listings, ["binance", "bybit"])
+    counts = router.summary()
+    ok &= check("watchlist splits evenly across venues",
+                abs(counts["binance"] - counts["bybit"]) <= 1,
+                f"{counts}")
+    ok &= check("single-venue symbols route to the only venue that lists them",
+                plan["ONLYB"] == "binance" and plan["ONLYY"] == "bybit")
+
+    # the queue: sockets never block, newest data wins under pressure
+    bus = EventBus(shards=2, maxsize=4, batch=32)
+    for i in range(10):
+        bus.publish(TradeEvent("binance", "BTCUSDT", 100 + i, 1, True, 1000 + i, i))
+    stats = bus.health()
+    seen = []
+
+    async def consume(ev):
+        seen.append(ev)
+
+    bus.start(consume)
+    await asyncio.sleep(0.2)
+    await bus.stop()
+    ok &= check("queue sheds oldest events instead of blocking the socket",
+                stats["dropped"] > 0 and seen and seen[-1].tid == 9,
+                f"dropped {stats['dropped']}, newest kept tid={seen[-1].tid if seen else None}")
+
+    book = PriceBook()
+    book.bulk_update({"BTCUSDT": 100.0}, "binance-ws")
+    book.update("BTCUSDT", 101.0, "bybit-trade")
+    ok &= check("price book merges venues, newest wins",
+                book.get("BTCUSDT") == 101.0 and book.sources["BTCUSDT"] == "bybit-trade")
+    return ok
+
+
+def test_institutional(ctx, zone) -> bool:
+    """Heatmap, execution algorithms and the liquidity-first gate."""
+    heat = ctx.heatmap
+    summary = heat.summary(ctx.price)
+    ok = check("heatmap accumulated resting liquidity",
+               summary["buckets"] > 0 and summary["updates"] > 0,
+               f"{summary['buckets']} buckets from {summary['updates']} snapshots")
+
+    targets = heat.target_pools("LONG", ctx.price, 0.2)
+    ok &= check("heatmap exposes an upside liquidity pool as a target",
+                bool(targets), f"{[round(t.price, 2) for t in targets[:3]]}")
+
+    support = heat.support_pool("LONG", ctx.price, 0.02)
+    ok &= check("heatmap identifies the pool defending the level",
+                support is not None and support.verdict in ("iceberg", "consumed", "resting"),
+                f"{support.to_dict() if support else None}")
+
+    trades = ctx.book.recent_trades(SETTINGS.algo_window_sec)
+    slicing = detect_slicing(trades, min_clips=SETTINGS.algo_min_clips,
+                             regularity_max=SETTINGS.algo_regularity_max)
+    ok &= check("uniform clips at regular intervals flagged as TWAP slicing",
+                slicing["found"] and slicing["twap"],
+                f"clip {slicing['clip']} x{slicing['count']} every {slicing['period']}s, "
+                f"dispersion {slicing['regularity']}")
+
+    ice = detect_iceberg(trades, heat, ctx.book.grid, min_ratio=SETTINGS.iceberg_ratio)
+    ok &= check("executed volume far above displayed size flagged as iceberg",
+                ice["found"], f"{ice['executed']} traded vs {ice['displayed']} shown "
+                              f"({ice['ratio']}x) on the {ice['side']}")
+
+    liq = LiquidityMap(ctx.candles[SETTINGS.ltf_mid], 2, 2, SETTINGS.equal_level_atr_tol)
+    labels = {l.label for l in liq.highs + liq.lows}
+    ok &= check("swings labelled as HH/HL/LH/LL", bool(labels & {"HH", "HL", "LH", "LL"}),
+                str(sorted(labels)))
+
+    tgts = liquidity_targets(ctx, "LONG", ctx.price)
+    ok &= check("liquidity targets built from heatmap and structure",
+                bool(tgts) and len({t["source"] for t in tgts}) >= 1,
+                f"{len(tgts)} targets, sources {sorted({t['source'] for t in tgts})}")
+
+    v = session_vwap(ctx.candles[SETTINGS.micro_interval])
+    ok &= check("session VWAP computed with bands",
+                bool(v) and v["upper"] > v["vwap"] > v["lower"],
+                f"vwap {v.get('vwap', 0):.2f}")
+    return ok
+
+
+def test_liquidity_gate(ctx) -> bool:
+    """A setup with nowhere to go must not fire, however clean the flow is."""
+    heat_bids, heat_asks = dict(ctx.heatmap.bids), dict(ctx.heatmap.asks)
+    ltf, htf = ctx.ltf_liquidity, ctx.htf_liquidity
+    try:
+        ctx.heatmap.asks.clear()          # remove every upside pool
+        ctx.ltf_liquidity = None
+        ctx.htf_liquidity = None
+        blocked = evaluate(ctx, SETTINGS, trend_state="range")
+        ok = check("setup with no liquidity target is rejected",
+                   not blocked.passed and "no_liquidity_target" in blocked.blockers,
+                   str(blocked.blockers[:3]))
+    finally:
+        ctx.heatmap.bids, ctx.heatmap.asks = heat_bids, heat_asks
+        ctx.ltf_liquidity, ctx.htf_liquidity = ltf, htf
+
+    stale = dict(ctx.execution)
+    sweep_cfg = SETTINGS.sweep_max_age_bars
+    try:
+        SETTINGS.sweep_max_age_bars = 0    # nothing can be recent enough
+        aged = evaluate(ctx, SETTINGS, trend_state="range")
+        ok &= check("stale sweep is rejected even with perfect order flow",
+                    not aged.passed and any("sweep" in b for b in aged.blockers),
+                    str(aged.blockers[:3]))
+    finally:
+        SETTINGS.sweep_max_age_bars = sweep_cfg
+        ctx.execution = stale
     return ok
 
 
@@ -532,19 +749,27 @@ def run_selftest() -> bool:
     print("\n\033[1m4. Order flow (footprint / absorption / book)\033[0m")
     _, ctx = test_orderflow(zone)
 
-    print("\n\033[1m5. Confirmation and risk model\033[0m")
+    print("\n\033[1m5. Institutional analysis (heatmap / algos / liquidity)\033[0m")
+    test_institutional(ctx, zone)
+
+    print("\n\033[1m6. Confirmation and risk model\033[0m")
     ok, signal = test_decision(ctx)
     if signal is None:
         _summary()
         return False
 
-    print("\n\033[1m6. Database and trade monitor\033[0m")
+    test_liquidity_gate(ctx)
+
+    print("\n\033[1m7. Database and trade monitor\033[0m")
     asyncio.run(_test_db(signal))
 
-    print("\n\033[1m7. Telegram rendering\033[0m")
+    print("\n\033[1m8. Multi-exchange feed\033[0m")
+    asyncio.run(_test_multi_exchange())
+
+    print("\n\033[1m9. Telegram rendering\033[0m")
     test_formatting(signal)
 
-    print("\n\033[1m8. Resilience (rate limiter, dead feeds, hung commands)\033[0m")
+    print("\n\033[1m10. Resilience (rate limiter, dead feeds, hung commands)\033[0m")
     asyncio.run(_test_resilience(zone))
 
     return _summary()

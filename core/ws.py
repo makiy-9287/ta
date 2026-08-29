@@ -7,10 +7,12 @@ Two kinds of connection:
    live prices for *every* symbol. Zero REST weight for proximity checks and
    for monitoring open setups.
 
-2. SymbolStream     - opened only for a symbol that has been *armed* (price is
-   inside a high-grade zone) and closed the moment it disarms. Carries
-   aggTrade + partial depth + 1m/3m/5m klines. This is what keeps memory flat:
-   we never hold order-flow state for symbols we are not actively hunting.
+2. SessionStream    - opened only for a symbol that has been *armed* (price is
+   inside a high-grade zone) and closed the moment it disarms. It is driven by
+   an exchange StreamSession, so the same class carries a Binance combined
+   stream or a Bybit subscription without knowing the difference. This is what
+   keeps memory flat: we never hold order-flow state for symbols we are not
+   actively hunting.
 """
 from __future__ import annotations
 
@@ -79,6 +81,14 @@ class _BaseStream:
     async def _handle(self, payload: dict) -> None:  # pragma: no cover - overridden
         raise NotImplementedError
 
+    async def _on_connect(self, sock) -> None:
+        """Hook for venues that need subscribe frames after the handshake."""
+        return None
+
+    def _start_keepalive(self, sock):
+        """Hook for venues needing application-level pings."""
+        return None
+
     async def _run(self) -> None:
         backoff = 1.0
         while self._running:
@@ -90,6 +100,8 @@ class _BaseStream:
                     close_timeout=5, max_queue=512,
                 ) as sock:
                     log.info("ws connected: %s", self.name)
+                    await self._on_connect(sock)
+                    keeper = self._start_keepalive(sock)
                     while self._running:
                         # A socket that opens, answers pings and never sends a
                         # payload is indistinguishable from a healthy one at the
@@ -177,30 +189,61 @@ class MarkPriceStream(_BaseStream):
                 self.prices.pop(sym, None)
 
 
-class SymbolStream(_BaseStream):
-    """Per-symbol combined stream feeding the order-flow engine."""
+class SessionStream(_BaseStream):
+    """
+    A stream driven by an exchange `StreamSession`.
 
-    def __init__(self, ws_base: str, symbol: str, handler: Handler,
-                 depth_levels: int = 20, depth_speed_ms: int = 500,
-                 intervals: Optional[List[str]] = None, idle_timeout: float = 90.0):
-        self.symbol = symbol.upper()
-        low = self.symbol.lower()
-        intervals = intervals or ["1m", "3m", "5m"]
-        parts = [f"{low}@aggTrade", f"{low}@depth{depth_levels}@{depth_speed_ms}ms"]
-        parts += [f"{low}@kline_{iv}" for iv in intervals]
-        url = f"{ws_base}/stream?streams=" + "/".join(parts)
-        super().__init__(url, f"flow:{self.symbol}", idle_timeout=idle_timeout)
-        self.handler = handler
+    The session owns the venue dialect: which frames to send on connect, how
+    often to ping at the application layer, and how to turn raw payloads into
+    normalised events. This class owns only the socket lifecycle.
+
+    The handler is called with a LIST of events and must not block - it exists
+    to drop them into the queue and return.
+    """
+
+    def __init__(self, session, on_events, name: str, idle_timeout: float = 120.0):
+        super().__init__(session.url, name, idle_timeout=idle_timeout)
+        self.session = session
+        self.on_events = on_events
+        self._keeper: Optional[asyncio.Task] = None
+
+    async def _on_connect(self, sock) -> None:
+        for msg in self.session.subscribe_messages():
+            await sock.send(json.dumps(msg))
+            await asyncio.sleep(0.05)
+
+    def _start_keepalive(self, sock):
+        payload = self.session.keepalive_message()
+        interval = self.session.keepalive_interval()
+        if not payload or interval <= 0:
+            return None
+
+        async def _ping() -> None:
+            # Bybit expects an application-level ping; a protocol ping is not
+            # enough to keep the subscription alive
+            while self._running:
+                await asyncio.sleep(interval)
+                try:
+                    await sock.send(json.dumps(payload))
+                except Exception:  # noqa: BLE001
+                    return
+
+        self._keeper = asyncio.create_task(_ping(), name=f"ping-{self.name}")
+        return self._keeper
 
     async def _handle(self, payload: dict) -> None:
-        data = payload.get("data") if "data" in payload else payload
-        if not isinstance(data, dict):
+        if not isinstance(payload, dict):
             return
-        event = data.get("e", "")
-        self.messages += 1
-        try:
-            await self.handler(event, data)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # noqa: BLE001
-            log.debug("handler error for %s/%s: %s", self.symbol, event, exc)
+        if payload.get("op") in ("pong", "ping") or payload.get("ret_msg") == "pong":
+            return
+        if payload.get("success") is not None and "op" in payload:
+            return                                    # subscribe acknowledgement
+        events = self.session.handle(payload)
+        if events:
+            self.on_events(events)
+
+    async def stop(self) -> None:
+        if self._keeper:
+            self._keeper.cancel()
+            self._keeper = None
+        await super().stop()

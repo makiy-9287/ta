@@ -30,15 +30,18 @@ from notifier.telegram import TelegramBot
 from .armed import ArmedContext
 from .confirm import evaluate
 from .database import Database
+from .events import DepthEvent, KlineEvent, TradeEvent
+from .exchanges import ADAPTERS
+from .feed import EventBus, PriceBook, SymbolRouter
 from .indicators import htf_trend
+from .liquidity import LiquidityMap
 from .models import Signal, Zone
 from .monitor import TradeMonitor
 from .rate_limiter import WeightLimiter
-from .rest import BinanceREST
 from .risk import build_signal
 from .utils import (collect_garbage, get_logger, human_delta, now_ms, rss_mb)
 from .watchlist import WatchlistManager
-from .ws import MarkPriceStream, SymbolStream
+from .ws import MarkPriceStream, SessionStream
 from .zones import ZoneEngine
 
 log = get_logger("engine")
@@ -48,21 +51,42 @@ class SniperEngine:
     def __init__(self, cfg: Settings):
         self.cfg = cfg
         self.limiter = WeightLimiter(cfg.weight_budget, cfg.bulk_weight_share)
-        self.rest = BinanceREST(cfg.rest_base, self.limiter, cfg.rest_timeout)
+        self.limiters = {"binance": self.limiter}
+
+        # one adapter per configured venue; each gets its own budget because
+        # the exchanges meter completely differently
+        self.adapters: Dict[str, object] = {}
+        for name in cfg.exchange_list:
+            factory = ADAPTERS.get(name)
+            if factory is None:
+                log.warning("unknown exchange '%s' - ignoring", name)
+                continue
+            limiter = self.limiter if name == "binance" else \
+                WeightLimiter(cfg.bybit_budget, cfg.bulk_weight_share)
+            self.limiters[name] = limiter
+            self.adapters[name] = factory(cfg, limiter)
+
+        self.history = self.adapters.get(cfg.history_exchange) or \
+            next(iter(self.adapters.values()))
+
         self.db = Database(cfg.db_path)
         self.bot = TelegramBot(cfg.telegram_token, cfg.telegram_chat_id,
                                cfg.telegram_poll_timeout, cfg.command_timeout_sec)
-        self.watchlist = WatchlistManager(self.rest, self.db, cfg)
+        self.watchlist = WatchlistManager(self.adapters, self.db, cfg)
         self.zone_engine = ZoneEngine(cfg)
-        self.mark = MarkPriceStream(cfg.ws_base, idle_timeout=cfg.ws_idle_timeout_sec)
+        self.bus = EventBus(cfg.queue_shards, cfg.queue_maxsize, cfg.queue_batch)
+        self.router = SymbolRouter(cfg)
+        self.prices = PriceBook()
+        self.mark = MarkPriceStream(cfg.ws_base, idle_timeout=cfg.ws_idle_timeout_sec) \
+            if "binance" in self.adapters else None
         self.monitor = TradeMonitor(self.db, cfg, self._trade_event, self._release_symbol)
 
         self.zones: Dict[str, List[Zone]] = {}
+        self.liquidity: Dict[str, LiquidityMap] = {}
         self.trend: Dict[str, str] = {}
         self.armed: Dict[str, ArmedContext] = {}
-        self.streams: Dict[str, SymbolStream] = {}
+        self.streams: Dict[str, SessionStream] = {}
         self.cooldown: Dict[str, float] = {}
-        self.rest_prices: Dict[str, float] = {}
         self._rest_price_ts = 0.0
         self._price_warn_ts = 0.0
         self.price_source = "starting"
@@ -86,7 +110,8 @@ class SniperEngine:
     # ================================================================ lifecycle
     async def start(self) -> None:
         await self.db.init()
-        await self.rest.start()
+        for adapter in self.adapters.values():
+            await adapter.start()
         await self.bot.start()
 
         ok, name = await self.bot.verify()
@@ -98,10 +123,18 @@ class SniperEngine:
         self.signals_total = int(await self.db.get_meta("signals_total", 0) or 0)
         await self.monitor.load()
         await self._restore_cooldowns()
-        await self.mark.start()
+
+        # the queue workers start before any socket, so no event is ever
+        # handled on the connection coroutine
+        self.bus.start(self._consume)
+        if self.mark:
+            self.mark.start_hook = None
+            await self.mark.start()
 
         log.info("building initial watchlist...")
         await self.watchlist.refresh()
+        self.router.plan(self.watchlist.symbols, self.watchlist.listings,
+                         list(self.adapters.keys()))
         await self._rebuild_zones(initial=True)
 
         if self.cfg.startup_notice:
@@ -114,6 +147,7 @@ class SniperEngine:
             asyncio.create_task(self._loop_arm(), name="arm"),
             asyncio.create_task(self._loop_monitor(), name="monitor"),
             asyncio.create_task(self._loop_flow_fallback(), name="flow-fallback"),
+            asyncio.create_task(self._loop_prices(), name="prices"),
             asyncio.create_task(self._loop_housekeeping(), name="housekeeping"),
             asyncio.create_task(self.bot.poll(self.handle_command), name="telegram"),
         ]
@@ -131,9 +165,12 @@ class SniperEngine:
         await asyncio.gather(*self._tasks, return_exceptions=True)
         for sym in list(self.streams):
             await self._disarm(sym, "shutdown")
-        await self.mark.stop()
+        await self.bus.stop()
+        if self.mark:
+            await self.mark.stop()
         await self.db.set_meta("signals_total", self.signals_total)
-        await self.rest.close()
+        for adapter in self.adapters.values():
+            await adapter.close()
         await self.bot.close()
         await self.db.close()
         log.info("shutdown complete")
@@ -164,7 +201,10 @@ class SniperEngine:
             try:
                 await asyncio.sleep(self.cfg.watchlist_refresh_hours * 3600)
                 await self.watchlist.refresh()
-                self.mark.prune(set(self.watchlist.symbols) | set(self.monitor.symbols()))
+                self.router.plan(self.watchlist.symbols, self.watchlist.listings,
+                                 list(self.adapters.keys()))
+                if self.mark:
+                    self.mark.prune(set(self.watchlist.symbols) | set(self.monitor.symbols()))
                 for sym in list(self.zones):
                     if sym not in self.watchlist.symbols:
                         self.zones.pop(sym, None)
@@ -227,7 +267,10 @@ class SniperEngine:
                 for sym, until in list(self.cooldown.items()):
                     if until < now:
                         self.cooldown.pop(sym, None)
-                self.mark.prune(set(self.watchlist.symbols) | set(self.monitor.symbols()))
+                keep = set(self.watchlist.symbols) | set(self.monitor.symbols())
+                if self.mark:
+                    self.mark.prune(keep)
+                self.prices.prune(keep)
                 await self.db.housekeeping()
                 freed = collect_garbage()
                 today = time.strftime("%Y-%m-%d")
@@ -236,7 +279,7 @@ class SniperEngine:
                     self.signals_today = 0
                 log.info("housekeeping: %.0f MB rss, %d objects freed, armed=%d, weight=%s",
                          rss_mb(), freed, len(self.armed), self.limiter.snapshot())
-                if not self.mark.alive or self.mark.stale_for > 120:
+                if self.mark and (not self.mark.alive or self.mark.stale_for > 120):
                     log.warning("mark price stream unhealthy (%s, %d reconnects, %d silent) "
                                 "- restarting; prices are coming from %s",
                                 self.mark.describe_staleness(), self.mark.reconnects,
@@ -282,12 +325,14 @@ class SniperEngine:
             return  # never move the goalposts mid-setup
         # background work: capped so it can never starve prices, arming or
         # the trade monitor of request weight
-        htf = await self.rest.klines(symbol, cfg.htf_interval, cfg.candle_limit, bulk=True)
-        mtf = await self.rest.klines(symbol, cfg.mtf_interval, cfg.candle_limit, bulk=True)
+        htf = await self.history.klines(symbol, cfg.htf_interval, cfg.candle_limit, bulk=True)
+        mtf = await self.history.klines(symbol, cfg.mtf_interval, cfg.candle_limit, bulk=True)
         if len(htf) < 100:
             return
         zones = self.zone_engine.build(symbol, htf, mtf)
         self.trend[symbol] = str(htf_trend(htf)["state"])
+        if self.zone_engine.last_liquidity is not None:
+            self.liquidity[symbol] = self.zone_engine.last_liquidity
         if zones:
             self.zones[symbol] = zones
             await self.db.replace_zones(symbol, zones)
@@ -296,38 +341,58 @@ class SniperEngine:
             await self.db.replace_zones(symbol, [])
 
     # ============================================================== proximity
-    async def _prices(self) -> Dict[str, float]:
+    async def _loop_prices(self) -> None:
         """
-        Live prices, preferring the all-market stream and falling back to a
-        cached REST poll. Must never block for long: the Telegram command
-        handler and the trade monitor both depend on it.
-        """
-        if self.mark.prices and self.mark.stale_for < 30:
-            self.price_source = "websocket"
-            return self.mark.prices
+        Keep the price book current from every venue.
 
+        Binance publishes an all-market mark price stream; Bybit does not, so
+        its side is polled cheaply. Whichever arrives most recently wins, which
+        also means one venue going dark never blinds us.
+        """
+        while not self._stop.is_set():
+            try:
+                if self.mark and self.mark.prices and self.mark.stale_for < 30:
+                    self.prices.bulk_update(self.mark.prices, "binance-ws")
+                    self.price_source = "websocket"
+                else:
+                    await self._poll_rest_prices()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                log.debug("price loop error: %s", exc)
+            await asyncio.sleep(self.cfg.price_poll_sec)
+
+    async def _poll_rest_prices(self) -> None:
         now = time.time()
-        if self.rest_prices and (now - self._rest_price_ts) < self.cfg.price_cache_sec:
-            return self.rest_prices
-        try:
-            # ticker/price costs weight 2 for every symbol; premiumIndex is 10
-            data = await asyncio.wait_for(self.rest.ticker_prices(), timeout=30)
-            prices = {d["symbol"]: float(d["price"]) for d in data if d.get("price")}
-            if prices:
-                self.rest_prices = prices
-                self._rest_price_ts = now
-                if self.price_source != "rest":
-                    log.warning("mark price stream unavailable (%s) - using REST prices",
-                                self.mark.describe_staleness())
-                self.price_source = "rest"
-        except asyncio.TimeoutError:
-            if now - self._price_warn_ts > 300:
-                self._price_warn_ts = now
-                log.warning("REST price fallback timed out (weight %s) - prices may lag",
-                            self.limiter.snapshot())
-        except Exception as exc:  # noqa: BLE001
-            log.debug("rest price fallback failed: %s", exc)
-        return self.rest_prices
+        if now - self._rest_price_ts < self.cfg.price_cache_sec:
+            return
+        got = False
+        for name, adapter in self.adapters.items():
+            if not hasattr(adapter, "prices"):
+                continue
+            try:
+                prices = await asyncio.wait_for(adapter.prices(), timeout=30)
+                if prices:
+                    self.prices.bulk_update(prices, f"{name}-rest")
+                    got = True
+            except asyncio.TimeoutError:
+                if now - self._price_warn_ts > 300:
+                    self._price_warn_ts = now
+                    log.warning("%s price poll timed out (weight %s)",
+                                name, self.limiters[name].snapshot())
+            except Exception as exc:  # noqa: BLE001
+                log.debug("%s price poll failed: %s", name, exc)
+        if got:
+            self._rest_price_ts = now
+            if self.price_source != "rest":
+                log.warning("mark price stream unavailable - using REST prices")
+            self.price_source = "rest"
+
+    async def _prices(self) -> Dict[str, float]:
+        """Snapshot of the merged price book; never blocks on the network."""
+        if not len(self.prices):
+            await self._poll_rest_prices()
+        return self.prices.as_dict()
 
     async def _scan_proximity(self) -> None:
         if self.paused:
@@ -361,38 +426,70 @@ class SniperEngine:
                 break
             await self._arm(symbol, zone, price)
 
+    async def _consume(self, event) -> None:
+        """
+        The only place market events are turned into analytics.
+
+        Runs in a queue worker, never on a socket coroutine, so a burst of
+        prints can never stall the connection that produced them.
+        """
+        symbol = getattr(event, "symbol", "")
+        ctx = self.armed.get(symbol)
+        if ctx is None:
+            return
+        if isinstance(event, TradeEvent):
+            ctx.on_trade(event)
+            self.prices.update(symbol, event.price, f"{event.exchange}-trade")
+        elif isinstance(event, DepthEvent):
+            ctx.on_depth(event)
+        elif isinstance(event, KlineEvent):
+            ctx.on_kline(event)
+
     async def _arm(self, symbol: str, zone: Zone, price: float) -> None:
+        venue = self.router.venue(symbol, self.cfg.history_exchange)
+        adapter = self.adapters.get(venue)
+        if adapter is None:
+            return
+
         async with self._arm_lock:
             if symbol in self.armed:
                 return
             ctx = ArmedContext(symbol, zone, self.cfg,
                                tick_size=self.watchlist.tick_size(symbol),
                                decimals=self.watchlist.decimals(symbol),
-                               ref_price=price)
+                               ref_price=price, exchange=venue,
+                               htf_liquidity=self.liquidity.get(symbol))
             self.armed[symbol] = ctx
         try:
-            await ctx.seed(self.rest)
+            await ctx.seed(adapter, self.history)
             if not self._ws_usable():
-                # the transport is demonstrably blocked - skip the socket and
-                # let the REST fallback loop feed this context instead
                 log.info("armed %s without a websocket (transport degraded, "
                          "using REST flow polling)", symbol)
                 return
-            stream = SymbolStream(
-                self.cfg.ws_base, symbol, ctx.on_event,
-                depth_levels=self.cfg.depth_levels,
-                depth_speed_ms=self.cfg.depth_speed_ms,
-                intervals=[self.cfg.micro_interval, self.cfg.ltf_fast, self.cfg.ltf_slow],
-                idle_timeout=self.cfg.ws_flow_idle_timeout_sec,
-            )
+            session = adapter.flow_session(
+                symbol,
+                [self.cfg.micro_interval, self.cfg.ltf_fast,
+                 self.cfg.ltf_slow, self.cfg.ltf_mid],
+                self.cfg.depth_levels, self.cfg.depth_speed_ms)
+            stream = SessionStream(session, self._publish, f"{venue}:{symbol}",
+                                   idle_timeout=self.cfg.ws_flow_idle_timeout_sec)
             await stream.start()
             self.streams[symbol] = stream
         except Exception as exc:  # noqa: BLE001
             log.warning("failed to arm %s: %s", symbol, exc)
             await self._disarm(symbol, "arm failed")
 
+    def _publish(self, events) -> None:
+        """Socket-side callback: enqueue and return. No analytics here."""
+        for ev in events:
+            self.bus.publish(ev)
+
     def _ws_usable(self) -> bool:
-        """Has the websocket transport shown any sign of life?"""
+        """Has any websocket transport shown a sign of life?"""
+        if self.bus.stats.pushed > 0:
+            return True
+        if self.mark is None:
+            return True
         if self.mark.last_msg_ts:
             return True
         return self.mark.silent_drops < 3 and self.mark.reconnects < 5
@@ -499,7 +596,8 @@ class SniperEngine:
                 for symbol, ctx in stalled[: self.cfg.max_armed_fallback]:
                     if symbol not in self.armed:
                         continue
-                    got = await ctx.poll_rest(self.rest)
+                    adapter = self.adapters.get(ctx.exchange) or self.history
+                    got = await ctx.poll_rest(adapter, self.history)
                     log.info("REST flow poll %s (ws silent %.0fs, new trades: %s)",
                              symbol, ctx.feed_age, "yes" if got else "none")
             except asyncio.CancelledError:
@@ -569,6 +667,8 @@ class SniperEngine:
             "rejected": self.rejected,
             "top_blockers": self.blockers.most_common(6),
             "min_volume": self.cfg.min_quote_volume,
+            "exchanges": self.router.summary() or {e: 0 for e in self.adapters},
+            "queue": self.bus.health(),
             "zone_refresh": self.cfg.zone_refresh_hours,
             "proximity": self.cfg.proximity_interval_sec,
         }
@@ -579,24 +679,35 @@ class SniperEngine:
             size = os.path.getsize(self.cfg.db_path) / (1024 * 1024)
         except OSError:
             pass
-        snap = self.limiter.snapshot()
+        feed = self.bus.health()
+        venues = {}
+        for name, lim in self.limiters.items():
+            snap = lim.snapshot()
+            venues[name] = {"used": snap["used_local"], "budget": snap["budget"],
+                            "penalty": snap["penalty_sec"]}
         return {
             "uptime": human_delta(time.time() - self.started_at),
             "rss_mb": rss_mb(),
-            "weight_used": snap["used_local"],
-            "weight_reported": snap["used_reported"],
-            "weight_budget": snap["budget"],
-            "markprice_ok": self.mark.alive and self.mark.stale_for < 30,
-            "markprice_symbols": len(self.mark.prices),
-            "markprice_age": self.mark.describe_staleness(),
+            "venues": venues,
+            "weight_used": self.limiter.snapshot()["used_local"],
+            "weight_reported": self.limiter.snapshot()["used_reported"],
+            "weight_budget": self.limiter.snapshot()["budget"],
+            "penalty_sec": self.limiter.snapshot()["penalty_sec"],
+            "markprice_ok": bool(self.mark and self.mark.alive and self.mark.stale_for < 30),
+            "markprice_symbols": len(self.mark.prices) if self.mark else 0,
+            "markprice_age": self.mark.describe_staleness() if self.mark else "disabled",
             "price_source": self.price_source,
-            "rest_price_symbols": len(self.rest_prices),
-            "silent_sockets": self.mark.silent_drops + sum(s.silent_drops for s in self.streams.values()),
-            "rest_polls": sum(c.rest_polls for c in self.armed.values()),
-            "weight_waits": snap["waits"],
-            "penalty_sec": snap["penalty_sec"],
+            "price_symbols": len(self.prices),
+            "rest_price_symbols": len(self.prices),
             "flow_streams": len(self.streams),
-            "reconnects": self.mark.reconnects + sum(s.reconnects for s in self.streams.values()),
+            "assignment": self.router.summary(),
+            "feed": feed,
+            "reconnects": (self.mark.reconnects if self.mark else 0)
+                          + sum(s.reconnects for s in self.streams.values()),
+            "silent_sockets": (self.mark.silent_drops if self.mark else 0)
+                              + sum(s.silent_drops for s in self.streams.values()),
+            "rest_polls": sum(c.rest_polls for c in self.armed.values()),
+            "weight_waits": self.limiter.snapshot()["waits"],
             "db_path": self.cfg.db_path,
             "db_size_mb": size,
             "tasks": len([t for t in self._tasks if not t.done()]),

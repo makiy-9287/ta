@@ -21,10 +21,16 @@ log = get_logger("structure")
 
 
 def detect_sweep(candles: Sequence[Candle], direction: str, cfg,
-                 zone: Optional[Zone] = None, atr_val: float = 0.0) -> Dict[str, object]:
+                 zone: Optional[Zone] = None, atr_val: float = 0.0,
+                 liquidity: Optional[object] = None) -> Dict[str, object]:
     """
-    Find the most recent liquidity sweep of a prior swing point,
-    plus whether price has reclaimed the swept level.
+    Find the most recent liquidity sweep of a prior swing point.
+
+    Recency is the whole point. A sweep 30 bars ago is stale: that liquidity is
+    already taken, the level no longer protects anything, and price will slice
+    straight back through it on the next drive. Only a sweep inside the last
+    `sweep_max_age_bars` counts, and the wick of *that* sweep - not some older
+    one - is what the stop is placed beyond.
     """
     res: Dict[str, object] = {"found": False, "reclaimed": False}
     n = len(candles)
@@ -51,6 +57,7 @@ def detect_sweep(candles: Sequence[Candle], direction: str, cfg,
     if not pivots:
         return res
 
+    best: Optional[Dict[str, object]] = None
     for i, level in reversed(pivots):
         pierce = max(a * cfg.sweep_min_pierce_atr, level * 0.0003)
         if direction == "LONG":
@@ -60,36 +67,62 @@ def detect_sweep(candles: Sequence[Candle], direction: str, cfg,
         if not pierced:
             continue
 
-        sweep_idx, last_pierce = pierced[0], pierced[-1]
-        # recency is measured from the last time price was on the wrong side of
-        # the level, not from the first tick that poked through it
-        if (n - 1 - last_pierce) > cfg.sweep_max_age_bars:
+        first_pierce, last_pierce = pierced[0], pierced[-1]
+        age = n - 1 - last_pierce
+        if age > cfg.sweep_max_age_bars:
             continue
 
-        tail = candles[sweep_idx:]
+        # the extreme of THIS sweep only: bars from the last excursion beyond
+        # the level, never an older penetration further back
+        recent_window = candles[max(first_pierce, last_pierce - cfg.sweep_wick_bars):]
         if direction == "LONG":
-            extreme = min(c.low for c in tail)
-            reclaimed = candles[-1].close > level and any(c.close > level for c in tail)
+            extreme = min(c.low for c in recent_window)
+            wick_bar = min(recent_window, key=lambda c: c.low)
+            reclaimed = candles[-1].close > level and any(c.close > level for c in candles[last_pierce:])
             displacement = (candles[-1].close - extreme) / a
         else:
-            extreme = max(c.high for c in tail)
-            reclaimed = candles[-1].close < level and any(c.close < level for c in tail)
+            extreme = max(c.high for c in recent_window)
+            wick_bar = max(recent_window, key=lambda c: c.high)
+            reclaimed = candles[-1].close < level and any(c.close < level for c in candles[last_pierce:])
             displacement = (extreme - candles[-1].close) / a
 
-        res.update({
+        # was there anything actually resting at the swept level?
+        structural = None
+        if liquidity is not None:
+            pool = _matching_level(liquidity, direction, level, a)
+            structural = pool.to_dict() if pool is not None else None
+
+        candidate = {
             "found": True,
             "level": level,
             "pivot_idx": i,
-            "sweep_idx": sweep_idx,
+            "sweep_idx": first_pierce,
             "last_pierce_idx": last_pierce,
             "extreme": extreme,
-            "age_bars": n - 1 - last_pierce,
+            "wick_ts": wick_bar.ts,
+            "age_bars": age,
+            "fresh": bool(age <= cfg.sweep_fresh_bars),
             "reclaimed": bool(reclaimed),
             "displacement_atr": round(displacement, 2),
             "pierce_atr": round(abs(level - extreme) / a, 3),
-        })
-        return res
-    return res
+            "structural": structural,
+        }
+        # prefer the freshest reclaimed sweep
+        if best is None or (candidate["reclaimed"] and not best["reclaimed"]) or \
+                (candidate["reclaimed"] == best["reclaimed"] and age < best["age_bars"]):
+            best = candidate
+        if best and best["reclaimed"] and best["age_bars"] <= cfg.sweep_fresh_bars:
+            break
+
+    return best or res
+
+
+def _matching_level(liquidity, direction: str, level: float, atr_val: float):
+    """Find the structural pool that the sweep took out, if any."""
+    levels = liquidity.lows if direction == "LONG" else liquidity.highs
+    tol = max(atr_val * 0.35, level * 0.0008)
+    matches = [l for l in levels if abs(l.price - level) <= tol]
+    return max(matches, key=lambda l: l.strength) if matches else None
 
 
 def detect_mss(candles: Sequence[Candle], direction: str, cfg,

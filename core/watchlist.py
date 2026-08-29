@@ -1,73 +1,81 @@
 """
-Watchlist construction.
+Watchlist construction across venues.
 
-Every 5 hours (configurable) we rebuild the universe: USDT-margined
-perpetuals that are actually trading, with 24h quote volume above the
-threshold. Anything thinner than that has an order book too sparse for
-footprint work, so it is not worth the bandwidth.
+Every 5 hours the universe is rebuilt: USDT perpetuals that are actually
+trading, with 24h quote volume above the threshold. Instrument lists are
+gathered from every configured exchange so the router knows which venue can
+stream which symbol - a coin listed on only one of them still gets covered,
+it just has no choice of feed.
 """
 from __future__ import annotations
 
+import asyncio
 import time
-from typing import Dict, List
+from typing import Dict, List, Set
 
-from .utils import decimals_from_tick, fmt_usd, get_logger, safe_float
+from .utils import fmt_usd, get_logger
 
 log = get_logger("watchlist")
 
 
 class WatchlistManager:
-    def __init__(self, rest, db, cfg):
-        self.rest = rest
+    def __init__(self, adapters: Dict[str, object], db, cfg):
+        self.adapters = adapters
         self.db = db
         self.cfg = cfg
         self.symbols: List[str] = []
         self.meta: Dict[str, dict] = {}
+        self.listings: Dict[str, Set[str]] = {}
         self.last_refresh: float = 0.0
         self.last_volume: Dict[str, float] = {}
 
-    async def load_exchange_info(self) -> None:
-        info = await self.rest.exchange_info()
+    async def load_instruments(self) -> None:
+        listings: Dict[str, Set[str]] = {}
         meta: Dict[str, dict] = {}
-        for s in info.get("symbols", []):
-            if s.get("status") != "TRADING":
+        for name, adapter in self.adapters.items():
+            try:
+                instruments = await adapter.instruments()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("%s instrument list failed: %s", name, exc)
+                listings[name] = set()
                 continue
-            if s.get("contractType") != "PERPETUAL":
-                continue
-            if s.get("quoteAsset") != self.cfg.quote_asset:
-                continue
-            tick = 0.0
-            step = 0.0
-            for f in s.get("filters", []):
-                if f.get("filterType") == "PRICE_FILTER":
-                    tick = safe_float(f.get("tickSize"))
-                elif f.get("filterType") == "LOT_SIZE":
-                    step = safe_float(f.get("stepSize"))
-            meta[s["symbol"]] = {
-                "tick_size": tick or 0.01,
-                "step_size": step,
-                "decimals": decimals_from_tick(tick or 0.01),
-                "base": s.get("baseAsset", ""),
-            }
+            listings[name] = set(instruments)
+            for symbol, info in instruments.items():
+                # the primary venue defines tick size and precision so a symbol
+                # is formatted identically no matter which feed carries it
+                if symbol not in meta or name == self.cfg.history_exchange:
+                    meta[symbol] = info
+            log.info("%s: %d tradable %s perpetuals", name, len(instruments),
+                     self.cfg.quote_asset)
+        self.listings = listings
         self.meta = meta
-        log.info("exchange info: %d tradable %s perpetuals", len(meta), self.cfg.quote_asset)
 
     async def refresh(self) -> List[str]:
         if not self.meta:
-            await self.load_exchange_info()
+            await self.load_instruments()
 
-        tickers = await self.rest.ticker_24h()
+        volumes: Dict[str, float] = {}
+        prices: Dict[str, float] = {}
+        for name, adapter in self.adapters.items():
+            try:
+                rows = await adapter.tickers()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("%s tickers failed: %s", name, exc)
+                continue
+            for r in rows:
+                sym = r["symbol"]
+                if sym not in self.meta:
+                    continue
+                # take the deeper venue's volume: it is the better read on how
+                # much real liquidity the symbol has
+                volumes[sym] = max(volumes.get(sym, 0.0), r["quote_volume"])
+                if r.get("price"):
+                    prices.setdefault(sym, r["price"])
+
         blacklist = self.cfg.blacklist_set
-        rows = []
-        for t in tickers:
-            sym = t.get("symbol", "")
-            if sym not in self.meta or sym in blacklist:
-                continue
-            qv = safe_float(t.get("quoteVolume"))
-            if qv < self.cfg.min_quote_volume:
-                continue
-            rows.append({"symbol": sym, "quote_volume": qv, "price": safe_float(t.get("lastPrice"))})
-
+        rows = [{"symbol": s, "quote_volume": v, "price": prices.get(s, 0.0)}
+                for s, v in volumes.items()
+                if v >= self.cfg.min_quote_volume and s not in blacklist]
         rows.sort(key=lambda r: r["quote_volume"], reverse=True)
         rows = rows[: self.cfg.max_watchlist]
 
@@ -89,6 +97,9 @@ class WatchlistManager:
 
     def decimals(self, symbol: str) -> int:
         return self.meta.get(symbol, {}).get("decimals", 4)
+
+    def listed_on(self, symbol: str) -> List[str]:
+        return [ex for ex, syms in self.listings.items() if symbol in syms]
 
     @property
     def due(self) -> bool:

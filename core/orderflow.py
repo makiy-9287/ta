@@ -18,6 +18,7 @@ symbol that stays armed for hours costs the same as one armed for minutes.
 """
 from __future__ import annotations
 
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Deque, Dict, List, Optional, Tuple
@@ -58,8 +59,9 @@ class FootprintBook:
         self.tick_size = max(tick_size, 1e-12)
         self.grid = self._make_grid(ref_price, tick_size, price_bins)
         self.buckets: Dict[int, Bucket] = {}
-        self.recent: Deque[Tuple[int, float, float, bool]] = deque(maxlen=4000)
+        self.recent: Deque[Tuple[int, float, float, bool]] = deque(maxlen=12000)
         self.total_trades = 0
+        self.rejected_ts = 0
         self.first_ts = 0
         self.last_ts = 0
 
@@ -75,9 +77,23 @@ class FootprintBook:
         return round(int(price / self.grid) * self.grid, 10)
 
     # ------------------------------------------------------------------ ingest
-    def add(self, price: float, qty: float, is_buyer_maker: bool, ts: int) -> None:
+    def add(self, price: float, qty: float, buy: bool, ts: int) -> None:
+        """`buy` is the AGGRESSOR side, normalised by the exchange adapter."""
         if qty <= 0 or price <= 0:
             return
+
+        # Timestamp sanity. The rolling window is pruned relative to the newest
+        # print, so one corrupt timestamp - a clock-skewed venue, a seconds
+        # value where milliseconds were expected, a garbage parse - would wipe
+        # the entire book in a single call and leave the symbol looking
+        # untradeable. Implausible prints are dropped instead.
+        if ts <= 0:
+            ts = self.last_ts or int(time.time() * 1000)
+        if self.last_ts:
+            drift = ts - self.last_ts
+            if drift > self.window_ms or drift < -2 * self.window_ms:
+                self.rejected_ts += 1
+                return
         key = (ts // self.bucket_ms) * self.bucket_ms
         b = self.buckets.get(key)
         if b is None:
@@ -93,25 +109,35 @@ class FootprintBook:
         if slot is None:
             slot = [0.0, 0.0]
             b.levels[lvl] = slot
-        if is_buyer_maker:
-            b.sell_vol += qty
-            slot[0] += qty
-        else:
+        if buy:
             b.buy_vol += qty
             slot[1] += qty
+        else:
+            b.sell_vol += qty
+            slot[0] += qty
 
-        self.recent.append((ts, price, qty, is_buyer_maker))
+        self.recent.append((ts, price, qty, buy))
         self.total_trades += 1
         self.first_ts = self.first_ts or ts
         self.last_ts = ts
         self._prune(ts)
 
-    def seed_from_rest(self, trades: List[dict]) -> None:
+    def add_event(self, ev) -> None:
+        self.add(ev.price, ev.qty, ev.buy, ev.ts)
+
+    def seed_from_events(self, trades) -> None:
         for t in trades:
             try:
-                self.add(float(t["p"]), float(t["q"]), bool(t["m"]), int(t["T"]))
-            except (KeyError, TypeError, ValueError):
+                self.add(t.price, t.qty, t.buy, t.ts)
+            except (AttributeError, TypeError, ValueError):
                 continue
+
+    def recent_trades(self, window_sec: Optional[int] = None) -> List[Tuple[int, float, float, bool]]:
+        """(ts, price, qty, buy) for the execution-algorithm detectors."""
+        if not window_sec or not self.last_ts:
+            return list(self.recent)
+        cutoff = self.last_ts - window_sec * 1000
+        return [t for t in self.recent if t[0] >= cutoff]
 
     def _prune(self, now: int) -> None:
         cutoff = now - self.window_ms
@@ -279,12 +305,33 @@ class FootprintBook:
                 buy += b
         return {"sell": sell, "buy": buy, "delta": buy - sell}
 
+    def as_candles(self) -> List:
+        """
+        Minute candles synthesised from the tape.
+
+        Used for CVD analysis when the venue streaming this symbol does not
+        publish taker volume in its klines (Bybit), so the divergence logic
+        works identically on both feeds.
+        """
+        from .models import Candle
+        out = []
+        for b in self.ordered():
+            if b.volume <= 0:
+                continue
+            out.append(Candle(
+                ts=b.ts, open=b.open, high=b.high, low=b.low, close=b.close,
+                volume=b.volume, quote_volume=b.volume * b.close, trades=b.trades,
+                taker_buy=b.buy_vol, close_ts=b.ts + self.bucket_ms,
+            ))
+        return out
+
     def health(self, min_trades: int) -> Dict[str, object]:
         t = self.totals()
         span = (self.last_ts - self.first_ts) / 1000 if self.last_ts and self.first_ts else 0
         return {
             "trades": t["trades"], "buckets": t["buckets"], "span_sec": int(span),
             "enough": t["trades"] >= min_trades and t["buckets"] >= 5,
+            "rejected_ts": self.rejected_ts,
             "memory_levels": sum(len(b.levels) for b in self.buckets.values()),
         }
 

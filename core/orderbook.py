@@ -33,6 +33,8 @@ class Wall:
     last_ts: int
     min_distance: float = 1e9   # closest price ever got, as a fraction
     touched: bool = False       # price actually reached the level
+    trough_qty: float = 0.0     # smallest size seen since it was last full
+    refills: int = 0            # times it was eaten down and replenished
     history: Deque[Tuple[int, float]] = field(default_factory=lambda: deque(maxlen=80))
 
     @property
@@ -43,6 +45,10 @@ class Wall:
         return max(0.0, 1.0 - (self.last_qty / self.peak_qty))
 
     def verdict(self) -> str:
+        # a level that is eaten down and put straight back is an iceberg: the
+        # strongest form of real, defended liquidity
+        if self.refills >= 1 and self.touched:
+            return "refilled"
         if self.touched and self.decay >= 0.40:
             return "consumed"
         if not self.touched and self.decay >= 0.60:
@@ -74,8 +80,13 @@ class DepthTracker:
             return
 
         self.updates += 1
-        self.last_bid = b[0][0]
-        self.last_ask = a[0][0]
+        # derive best bid/ask from the levels themselves rather than trusting
+        # position: an unsorted book would otherwise poison the mid price, and
+        # every distance, touch and wall verdict computed from it
+        self.last_bid = max(p for p, _ in b)
+        self.last_ask = min(p for p, _ in a)
+        if self.last_ask <= self.last_bid:
+            return                    # crossed or malformed snapshot
         mid = (self.last_bid + self.last_ask) / 2
         bid_sum = sum(q for _, q in b)
         ask_sum = sum(q for _, q in a)
@@ -97,6 +108,13 @@ class DepthTracker:
                              last_qty=qty, first_ts=ts, last_ts=ts)
                     self.walls[key] = w
                 else:
+                    if qty < w.last_qty:
+                        w.trough_qty = qty if w.trough_qty <= 0 else min(w.trough_qty, qty)
+                    elif w.trough_qty > 0 and w.peak_qty > 0 \
+                            and w.trough_qty <= w.peak_qty * 0.55 \
+                            and qty >= w.peak_qty * 0.70:
+                        w.refills += 1
+                        w.trough_qty = 0.0
                     w.peak_qty = max(w.peak_qty, qty)
                     w.last_qty = qty
                     w.last_ts = ts
@@ -143,6 +161,7 @@ class DepthTracker:
                     if s == side and abs(w.price - price) / max(1e-12, price) <= max_distance]
         verdicts = [w.verdict() for w in relevant]
         consumed = verdicts.count("consumed")
+        refilled = verdicts.count("refilled")
         pulled = verdicts.count("pulled")
         resting = verdicts.count("resting")
         total = max(1, len(relevant))
@@ -150,14 +169,16 @@ class DepthTracker:
         return {
             "count": len(relevant),
             "consumed": consumed,
+            "refilled": refilled,
             "pulled": pulled,
             "resting": resting,
             "pull_ratio": pulled / total,
-            "case_b": consumed >= 1,                       # real execution + hold
-            "case_a": pulled >= 1 and consumed == 0,       # spoof behaviour
+            "case_b": (consumed + refilled) >= 1,          # real execution + hold
+            "case_a": pulled >= 1 and (consumed + refilled) == 0,   # spoof behaviour
             "biggest": None if best is None else {
                 "price": best.price, "peak": round(best.peak_qty, 3),
                 "decay": round(best.decay, 2), "verdict": best.verdict(),
+                "refills": best.refills,
             },
         }
 
