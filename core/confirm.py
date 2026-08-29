@@ -24,7 +24,7 @@ from typing import Dict, List, Optional
 from .indicators import atr, cvd_divergence, cvd_reclaim, delta_zscore, htf_trend
 from .models import Decision
 from .structure import detect_mss, detect_sweep, reclaim_strength, structure_bias
-from .utils import clamp, get_logger
+from .utils import clamp, get_logger, interval_seconds
 
 log = get_logger("confirm")
 
@@ -81,6 +81,9 @@ def evaluate(ctx, cfg, trend_state: str = "range") -> Decision:
     if d.blockers:
         return d
 
+    flow_window = min(cfg.flow_analysis_min, cfg.footprint_window_min) * 60
+    d.details["flow_window_sec"] = flow_window
+
     atr_fast = atr(fast, 14)
     atr_slow = atr(slow, 14)
     price = ctx.price
@@ -99,7 +102,7 @@ def evaluate(ctx, cfg, trend_state: str = "range") -> Decision:
     heatmap = ctx.heatmap
 
     targets = liquidity_targets(ctx, direction, price)
-    d.details["targets"] = [t for t in targets[:4]]
+    d.details["targets"] = targets[:12]
     bias = liq.resting_bias(price, cfg.liquidity_span_pct) if liq else {}
     htf_bias = htf_liq.resting_bias(price, cfg.liquidity_span_pct * 2) if htf_liq else {}
     d.details["liquidity_bias"] = bias
@@ -125,10 +128,16 @@ def evaluate(ctx, cfg, trend_state: str = "range") -> Decision:
                     f"{support_pool.price:.{ctx.decimals}f} holding the level")
 
     # ============================================================ 2. THE SWEEP
-    sweep = detect_sweep(slow, direction, cfg, zone=zone, atr_val=atr_slow, liquidity=liq)
+    # The structural match must use a map built on the SAME candles the sweep
+    # was found in. Comparing a 5m swing low against 15m swing prices, with a
+    # 5m ATR tolerance, fails almost every time - and with a mandatory
+    # structural sweep that mismatch silently blocks nearly every setup.
+    sweep = detect_sweep(slow, direction, cfg, zone=zone, atr_val=atr_slow,
+                         liquidity=ctx.liquidity_for(cfg.ltf_slow))
     sweep_tf = cfg.ltf_slow
     if not sweep.get("found"):
-        sweep = detect_sweep(fast, direction, cfg, zone=zone, atr_val=atr_fast, liquidity=liq)
+        sweep = detect_sweep(fast, direction, cfg, zone=zone, atr_val=atr_fast,
+                             liquidity=ctx.liquidity_for(cfg.ltf_fast))
         sweep_tf = cfg.ltf_fast
     sweep["tf"] = sweep_tf
     d.details["sweep"] = sweep
@@ -147,15 +156,31 @@ def evaluate(ctx, cfg, trend_state: str = "range") -> Decision:
             d.details["sweep_aging"] = age
         if cfg.require_structural_sweep and not sweep.get("structural"):
             d.block("sweep_took_no_structural_liquidity")
-        if not d.blockers or "no_liquidity_sweep" not in d.blockers:
+        if sweep.get("reclaimed") and age <= cfg.sweep_max_age_bars:
             label = (sweep.get("structural") or {}).get("label", "level")
             d.add(True, f"Swept {label} at {sweep.get('level', 0):.{ctx.decimals}f} "
                         f"{age} bars ago, reclaimed")
 
     # ========================================================= 3. ABSORPTION
+    # Anchor the absorption window to the sweep itself.
+    #
+    # Absorption is a claim about what happened AT the level: aggression hit
+    # it and price refused to go. Measuring that across a fixed hour of
+    # unrelated price makes the range huge, the recovery fraction tiny, and a
+    # textbook absorption invisible. Measuring from the sweep wick to now
+    # sizes the window to the event, on any symbol and any timeframe.
+    bar_sec = interval_seconds(sweep_tf)
+    wick_ts = int(sweep.get("wick_ts") or 0)
+    if wick_ts and book.last_ts:
+        span = (book.last_ts - wick_ts) / 1000.0 + 2 * bar_sec
+        absorb_window = int(clamp(span, cfg.flow_min_window_min * 60, flow_window))
+    else:
+        absorb_window = flow_window
+    d.details["absorption_window_sec"] = absorb_window
+
     absorb = book.absorption(direction, vol_mult=cfg.absorption_vol_mult,
                              recovery_frac=cfg.absorption_efficiency,
-                             window_sec=cfg.footprint_window_min * 60)
+                             window_sec=absorb_window)
     d.details["absorption"] = absorb
     if not absorb["found"]:
         d.block("no_absorption")
@@ -211,12 +236,26 @@ def evaluate(ctx, cfg, trend_state: str = "range") -> Decision:
     want = "bullish" if long_ else "bearish"
     opposite = "bearish" if long_ else "bullish"
     mtf_score = sum([mid_bias == want, fast_bias == want])
-    if mid_bias == opposite and fast_bias == opposite:
-        d.block("all_lower_timeframes_opposed")
+    # A reversal at demand forms *after* a sell-off, so both lower timeframes
+    # read bearish right up until the structure shift - which is already
+    # mandatory below. Blocking on it would reject exactly the setups this
+    # strategy exists to take, so it costs confidence instead.
+    both_opposed = mid_bias == opposite and fast_bias == opposite
+    d.details["ltf_opposed"] = both_opposed
     if mtf_score:
         d.add(True, f"{cfg.ltf_mid}/{cfg.ltf_fast} structure aligned ({mtf_score}/2)")
 
     # ============================================== 8. TREND / COUNTER-TREND
+    # evidence tally so far, used by the counter-trend rule below
+    optional_early = sum([
+        1 if absorb["found"] else 0,
+        1 if institutional else 0,
+        1 if (div.get("found") or rec.get("found")) else 0,
+        1 if mss_ok else 0,
+        1 if mtf_score else 0,
+    ])
+    d.details["evidence_before_trend_gate"] = optional_early
+
     conflict = _trend_conflict(direction, trend_state)
     d.details["trend_conflict"] = conflict
     if cfg.respect_htf_trend and conflict == "hard":
@@ -224,12 +263,19 @@ def evaluate(ctx, cfg, trend_state: str = "range") -> Decision:
     elif conflict == "soft" and cfg.counter_trend_policy != "allow":
         # trading back into a trend needs a materially better setup: a top
         # grade zone, a fresh structural sweep and a real participant
-        strict_ok = (zone.grade == "A+" and bool(sweep.get("fresh"))
-                     and bool(sweep.get("structural")) and institutional)
+        # Counter-trend needs more EVIDENCE, not a better grade. Zone quality
+        # already feeds the confidence score, so gating on the A/A+ boundary
+        # rejected textbook reversals - a fresh structural sweep, heavy
+        # absorption, an iceberg on the bid and a structure shift - purely
+        # because the zone scored 75 rather than 80.
+        strict_ok = (bool(sweep.get("fresh"))
+                     and bool(sweep.get("structural"))
+                     and institutional
+                     and optional_early >= cfg.min_optional_confirms + 1)
         if cfg.counter_trend_policy == "block":
             d.block("counter_trend_blocked")
         elif not strict_ok:
-            d.block("counter_trend_needs_A+_fresh_sweep_and_institutional_flow")
+            d.block("counter_trend_needs_fresh_structural_sweep_and_institutional_flow")
         else:
             d.add(True, "Counter-trend setup meets the strict criteria")
 
@@ -245,7 +291,7 @@ def evaluate(ctx, cfg, trend_state: str = "range") -> Decision:
         d.add(True, f"Book stacked in our favour ({ob['stack_ratio']}x)")
 
     # ====================================================== 10. FOOTPRINT / DELTA
-    imb = book.imbalances(ratio=cfg.imbalance_ratio, window_sec=cfg.footprint_window_min * 60)
+    imb = book.imbalances(ratio=cfg.imbalance_ratio, window_sec=flow_window)
     d.details["imbalance"] = imb
     stack = imb["buy_stack"] if long_ else imb["sell_stack"]
     if not imb["clean"]:
@@ -254,7 +300,7 @@ def evaluate(ctx, cfg, trend_state: str = "range") -> Decision:
         d.add(True, f"Stacked {'buy' if long_ else 'sell'} imbalances x{stack}")
 
     dex = book.delta_extreme(direction, z_threshold=cfg.delta_extreme_z,
-                             window_sec=cfg.footprint_window_min * 60)
+                             window_sec=flow_window)
     d.details["delta_extreme"] = dex
     if dex["found"]:
         d.add(True, f"Delta extreme ({dex['z']} sigma "
@@ -305,8 +351,11 @@ def evaluate(ctx, cfg, trend_state: str = "range") -> Decision:
         conf += WEIGHTS["delta"] * clamp(abs(float(dex["z"])) / (cfg.delta_extreme_z * 2), 0.4, 1.0)
     if stack >= cfg.min_imbalance_stack:
         conf += WEIGHTS["imbalance"]
-    if conflict == "soft":
-        conf -= cfg.counter_trend_penalty
+    # NOTE: the counter-trend cost is applied once, by raising the threshold
+    # below. Subtracting it here as well charged it twice - an 0.16 penalty
+    # where 0.08 was intended, quietly rejecting good reversals.
+    if both_opposed:
+        conf -= cfg.ltf_opposed_penalty
 
     d.confidence = round(clamp(conf, 0.0, 1.0), 3)
 

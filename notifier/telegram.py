@@ -27,6 +27,7 @@ COMMANDS = [
     ("pnl", "Performance - /pnl today|week|month|all"),
     ("report", "Full report - /report week"),
     ("stats", "Engine internals and hit rates"),
+    ("why", "Why a symbol has not fired - /why BTCUSDT"),
     ("health", "Connections, rate-limit and memory"),
     ("close", "Force-close a setup - /close 12"),
     ("pause", "Stop generating new signals"),

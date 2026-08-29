@@ -55,6 +55,8 @@ class Settings:
     bybit_rest: str = field(default_factory=lambda: _s("BYBIT_REST", "https://api.bybit.com"))
     bybit_ws: str = field(default_factory=lambda: _s("BYBIT_WS", "wss://stream.bybit.com"))
     bybit_budget: int = field(default_factory=lambda: _i("BYBIT_BUDGET_PER_MIN", 500))
+    venue_starve_threshold: int = field(default_factory=lambda: _i("VENUE_STARVE_THRESHOLD", 3))
+    venue_block_minutes: int = field(default_factory=lambda: _i("VENUE_BLOCK_MINUTES", 60))
 
     # ------------------------------------------------------------ event bus
     queue_shards: int = field(default_factory=lambda: _i("QUEUE_SHARDS", 2))
@@ -111,6 +113,7 @@ class Settings:
     respect_htf_trend: bool = field(default_factory=lambda: _b("RESPECT_HTF_TREND", True))
     counter_trend_policy: str = field(default_factory=lambda: _s("COUNTER_TREND_POLICY", "strict"))
     counter_trend_penalty: float = field(default_factory=lambda: _f("COUNTER_TREND_PENALTY", 0.08))
+    ltf_opposed_penalty: float = field(default_factory=lambda: _f("LTF_OPPOSED_PENALTY", 0.05))
 
     # ---------------------------------------------------------------- proximity / arming
     proximity_interval_sec: int = field(default_factory=lambda: _i("PROXIMITY_INTERVAL_SEC", 300))
@@ -129,7 +132,13 @@ class Settings:
     micro_limit: int = field(default_factory=lambda: _i("MICRO_LIMIT", 300))
     ltf_limit: int = field(default_factory=lambda: _i("LTF_LIMIT", 200))
     footprint_bucket_sec: int = field(default_factory=lambda: _i("FOOTPRINT_BUCKET_SEC", 60))
+    # Retention is long so CVD has history. ANALYSIS is short, because
+    # absorption, imbalance and delta extremes are statements about what is
+    # happening at the level right now - measuring them across an hour and a
+    # half of unrelated price dilutes them into nothing.
     footprint_window_min: int = field(default_factory=lambda: _i("FOOTPRINT_WINDOW_MIN", 90))
+    flow_analysis_min: int = field(default_factory=lambda: _i("FLOW_ANALYSIS_MIN", 25))
+    flow_min_window_min: int = field(default_factory=lambda: _i("FLOW_MIN_WINDOW_MIN", 6))
     footprint_price_bins: int = field(default_factory=lambda: _i("FOOTPRINT_PRICE_BINS", 60))
     imbalance_ratio: float = field(default_factory=lambda: _f("IMBALANCE_RATIO", 3.0))
     min_imbalance_stack: int = field(default_factory=lambda: _i("MIN_IMBALANCE_STACK", 2))
@@ -222,6 +231,7 @@ class Settings:
     max_armed_fallback: int = field(default_factory=lambda: _i("MAX_ARMED_FALLBACK", 4))
     price_cache_sec: float = field(default_factory=lambda: _f("PRICE_CACHE_SEC", 5.0))
     price_poll_sec: float = field(default_factory=lambda: _f("PRICE_POLL_SEC", 2.0))
+    price_max_age_sec: float = field(default_factory=lambda: _f("PRICE_MAX_AGE_SEC", 90.0))
     command_timeout_sec: int = field(default_factory=lambda: _i("COMMAND_TIMEOUT_SEC", 45))
 
     # ------------------------------------------------------------------ helpers

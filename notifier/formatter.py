@@ -306,6 +306,14 @@ def health_message(h: dict) -> str:
     if assign:
         lines.append("Stream split: " + " · ".join(
             f"<b>{esc(k)}</b> {v}" for k, v in assign.items()))
+    trades = h.get("venue_trades") or {}
+    if trades:
+        lines.append("Trades received: " + " · ".join(
+            f"{esc(k)} <b>{v:,}</b>" for k, v in trades.items()))
+    blocked = h.get("venue_blocked") or []
+    if blocked:
+        lines.append(f"⚠️ <b>{esc(', '.join(blocked))}</b> feed delivered no trades — "
+                     f"streaming moved to the working venue (REST history unaffected)")
 
     feed = h.get("feed") or {}
     lines += [
@@ -314,7 +322,9 @@ def health_message(h: dict) -> str:
         f"Event lag <b>{feed.get('lag_ms', 0)} ms</b> (peak {feed.get('max_lag_ms', 0)} ms)",
         f"Mark-price stream {'🟢' if h['markprice_ok'] else '🔴'} "
         f"({h['markprice_symbols']} symbols, {esc(str(h['markprice_age']))})",
-        f"Price source <b>{esc(h['price_source'])}</b> · {h['price_symbols']} symbols",
+        f"Price source <b>{esc(h['price_source'])}</b> · {h['price_symbols']} symbols"
+        + (f" · ⚠️ <b>{h['stale_prices']}</b> open setups without a fresh price"
+           if h.get("stale_prices") else ""),
         f"Flow streams <b>{h['flow_streams']}</b> · reconnects <b>{h['reconnects']}</b>"
         + (f" · <b>{h['silent_sockets']}</b> silent" if h.get("silent_sockets") else ""),
     ]
@@ -334,6 +344,60 @@ def health_message(h: dict) -> str:
     return "\n".join(lines)
 
 
+def why_message(ctx, decision, trend: str) -> str:
+    """Full decision breakdown for one armed symbol - the answer to
+    'why is nothing firing?'"""
+    d = decision.details
+    dec = ctx.decimals
+    lines = [
+        f"🔍 <b>{esc(ctx.symbol)}</b> {ctx.direction} · zone {ctx.zone.score}"
+        f" ({esc(ctx.zone.grade or '-')}) · via {esc(ctx.exchange)}",
+        f"4H trend <b>{esc(trend)}</b> · armed {ctx.age_min:.0f}m · "
+        f"confidence <b>{decision.confidence:.2f}</b>",
+        "",
+    ]
+    if decision.passed:
+        lines.append("✅ <b>All gates passed</b> — a signal should be firing now.")
+    else:
+        lines.append("<b>Blocked by</b>")
+        for b in decision.blockers:
+            lines.append(f"⛔ {esc(b)}")
+
+    sweep = d.get("sweep") or {}
+    absorb = d.get("absorption") or {}
+    bias = d.get("liquidity_bias") or {}
+    heat = d.get("heatmap") or {}
+    flow = d.get("flow") or {}
+    ex = d.get("execution") or {}
+    targets = d.get("targets") or []
+
+    lines += [
+        "",
+        "<b>State</b>",
+        f"· flow: {flow.get('trades', 0)} trades / {flow.get('buckets', 0)} buckets, "
+        f"{d.get('flow_age', '?')}s old",
+        f"· sweep: " + ("none found" if not sweep.get("found") else
+                       f"{sweep.get('level', 0):.{dec}f} "
+                       f"{sweep.get('age_bars')} bars ago, "
+                       f"reclaimed={sweep.get('reclaimed')}, "
+                       f"structural={bool(sweep.get('structural'))}"),
+        f"· absorption: {absorb.get('ratio', 0)}x, recovery {absorb.get('recovery', 0)}, "
+        f"found={absorb.get('found')}",
+        f"· liquidity: resting {esc(str(bias.get('bias', '?')))} "
+        f"(ratio {bias.get('ratio')}) · heatmap imbalance {heat.get('imbalance')}",
+        f"· institutional: {bool(ex.get('institutional'))}",
+        f"· confirmations: {d.get('optional_confirms', 0)}",
+    ]
+    if targets:
+        lines.append("· targets: " + ", ".join(
+            f"{t['price']:.{dec}f} ({esc(str(t['source']))})" for t in targets[:3]))
+    if decision.reasons:
+        lines += ["", "<b>Already satisfied</b>"]
+        for r in decision.reasons[:6]:
+            lines.append(f"✔️ {esc(r)}")
+    return "\n".join(lines)
+
+
 def help_message() -> str:
     return "\n".join([
         "🤖 <b>SNIPER FLOW</b> — order-flow signal engine",
@@ -346,6 +410,7 @@ def help_message() -> str:
         "<b>/pnl [today|week|month|all]</b> — performance",
         "<b>/report [period]</b> — full report",
         "<b>/stats</b> — internals, armed symbols, rejection reasons",
+        "<b>/why SYMBOL</b> — full gate breakdown for an armed symbol",
         "<b>/health</b> — connections, rate limit, memory",
         "<b>/close ID</b> — force-close a setup at market",
         "<b>/pause</b> · <b>/resume</b> — signal generation",

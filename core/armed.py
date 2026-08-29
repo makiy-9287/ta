@@ -76,6 +76,7 @@ class ArmedContext:
         # derived views, refreshed on a timer rather than per event
         self.htf_liquidity = htf_liquidity
         self.ltf_liquidity: Optional[LiquidityMap] = None
+        self._liq_maps: Dict[str, LiquidityMap] = {}
         self.execution: Dict[str, object] = {}
         self.vwap: Dict[str, object] = {}
         self._derived_ts = 0.0
@@ -220,12 +221,15 @@ class ArmedContext:
             return
         self._derived_ts = now
 
-        slow = self.candles.get(self.cfg.ltf_slow) or []
-        mid = self.candles.get(self.cfg.ltf_mid) or []
-        source = mid if len(mid) >= 60 else slow
-        if len(source) >= 40:
-            self.ltf_liquidity = LiquidityMap(source, left=2, right=2,
-                                              equal_tol_atr=self.cfg.equal_level_atr_tol)
+        # one map per timeframe: whatever finds a sweep must be matched against
+        # structure from the same candles, or the levels never line up
+        for interval in (self.cfg.ltf_fast, self.cfg.ltf_slow, self.cfg.ltf_mid):
+            series = self.candles.get(interval) or []
+            if len(series) >= 40:
+                self._liq_maps[interval] = LiquidityMap(
+                    series, left=2, right=2, equal_tol_atr=self.cfg.equal_level_atr_tol)
+        self.ltf_liquidity = (self._liq_maps.get(self.cfg.ltf_mid)
+                              or self._liq_maps.get(self.cfg.ltf_slow))
         try:
             self.execution = analyse_execution(self.book, self.heatmap, self.direction,
                                                window_sec=self.cfg.algo_window_sec,
@@ -237,6 +241,10 @@ class ArmedContext:
         if micro:
             self.vwap = vwap_context(micro, self.price, self.direction,
                                      lookback=self.cfg.vwap_lookback)
+
+    def liquidity_for(self, interval: str) -> Optional[LiquidityMap]:
+        """Structural map built from a specific timeframe's candles."""
+        return self._liq_maps.get(interval) or self.ltf_liquidity
 
     def micro_cvd_candles(self) -> List[Candle]:
         """
@@ -331,4 +339,5 @@ class ArmedContext:
         for k in self.candles:
             self.candles[k] = []
         self.ltf_liquidity = None
+        self._liq_maps.clear()
         self.execution = {}

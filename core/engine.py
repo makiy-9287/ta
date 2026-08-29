@@ -88,9 +88,14 @@ class SniperEngine:
         self.armed: Dict[str, ArmedContext] = {}
         self.streams: Dict[str, SessionStream] = {}
         self.cooldown: Dict[str, float] = {}
+        self.venue_trades: Counter = Counter()      # trade events actually received
+        self.venue_starved: Counter = Counter()     # contexts that got nothing
+        self.venue_blocked_until: Dict[str, float] = {}
+        self.starve_count: Counter = Counter()      # per symbol, for backoff
         self._rest_price_ts = 0.0
         self._price_warn_ts = 0.0
         self.price_source = "starting"
+        self._stale_warn_ts = 0.0
 
         self._arm_lock = asyncio.Lock()
         self._tasks: List[asyncio.Task] = []
@@ -134,8 +139,7 @@ class SniperEngine:
 
         log.info("building initial watchlist...")
         await self.watchlist.refresh()
-        self.router.plan(self.watchlist.symbols, self.watchlist.listings,
-                         list(self.adapters.keys()))
+        self._replan_streams()
         await self._rebuild_zones(initial=True)
 
         if self.cfg.startup_notice:
@@ -202,8 +206,7 @@ class SniperEngine:
             try:
                 await asyncio.sleep(self.cfg.watchlist_refresh_hours * 3600)
                 await self.watchlist.refresh()
-                self.router.plan(self.watchlist.symbols, self.watchlist.listings,
-                                 list(self.adapters.keys()))
+                self._replan_streams()
                 if self.mark:
                     self.mark.prune(set(self.watchlist.symbols) | set(self.monitor.symbols()))
                 for sym in list(self.zones):
@@ -276,9 +279,20 @@ class SniperEngine:
     async def _loop_monitor(self) -> None:
         while not self._stop.is_set():
             try:
-                prices = await self._prices()
-                if prices:
-                    await self.monitor.on_prices(prices)
+                await self._prices()
+                # only hand the monitor prices we know are current: a stale
+                # quote means a stop that HAS been hit is never seen
+                max_age = self.cfg.price_max_age_sec
+                fresh = {s: p for s, p in self.prices.as_dict().items()
+                         if self.prices.age(s) <= max_age}
+                stale = [s for s in self.monitor.symbols() if s not in fresh]
+                if stale and (time.time() - self._stale_warn_ts) > 120:
+                    self._stale_warn_ts = time.time()
+                    log.warning("no fresh price for open setups: %s - stop and target "
+                                "detection is blind on these until the feed returns",
+                                ", ".join(sorted(stale)[:6]))
+                if fresh:
+                    await self.monitor.on_prices(fresh)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001
@@ -303,8 +317,15 @@ class SniperEngine:
                 if today != self._today:
                     self._today = today
                     self.signals_today = 0
-                log.info("housekeeping: %.0f MB rss, %d objects freed, armed=%d, weight=%s",
-                         rss_mb(), freed, len(self.armed), self.limiter.snapshot())
+                feed = self.bus.health()
+                venues = " ".join(f"{v}={self.venue_trades[v]}" for v in self.adapters)
+                blocked = [v for v in self.adapters
+                           if self.venue_blocked_until.get(v, 0) > time.time()]
+                log.info("housekeeping: %.0f MB rss, %d freed, armed=%d, trades by venue: %s%s, "
+                         "queue pending=%d dropped=%d lag=%.0fms",
+                         rss_mb(), freed, len(self.armed), venues,
+                         f" (blocked: {','.join(blocked)})" if blocked else "",
+                         feed["pending"], feed["dropped"], feed["lag_ms"])
                 if self.mark and not self.mark.last_msg_ts \
                         and self.mark.silent_drops >= self.cfg.markprice_give_up:
                     # this host cannot receive the mark price stream. Every
@@ -457,9 +478,13 @@ class SniperEngine:
             if self.cooldown.get(symbol, 0) > time.time():
                 continue
             for z in zones:
-                if z.contains(price, self.cfg.arm_buffer_zone_frac):
-                    candidates.append((z.score, symbol, z, price))
-                    break
+                if not z.contains(price, self.cfg.arm_buffer_zone_frac):
+                    continue
+                if not self._viable_under_trend(z, symbol):
+                    self.blockers["skipped_unviable_vs_trend"] += 1
+                    continue
+                candidates.append((z.score, symbol, z, price))
+                break
 
         candidates.sort(reverse=True, key=lambda c: c[0])
         if candidates:
@@ -485,6 +510,7 @@ class SniperEngine:
             return
         if isinstance(event, TradeEvent):
             ctx.on_trade(event)
+            self.venue_trades[event.exchange] += 1
             self.prices.update(symbol, event.price, f"{event.exchange}-trade")
         elif isinstance(event, DepthEvent):
             ctx.on_depth(event)
@@ -493,6 +519,11 @@ class SniperEngine:
 
     async def _arm(self, symbol: str, zone: Zone, price: float) -> None:
         venue = self.router.venue(symbol, self.cfg.history_exchange)
+        if self.venue_blocked_until.get(venue, 0) > time.time():
+            alternatives = [v for v in self.active_venues()
+                            if symbol in self.watchlist.listings.get(v, set())]
+            if alternatives:
+                venue = alternatives[0]
         adapter = self.adapters.get(venue)
         if adapter is None:
             return
@@ -529,6 +560,67 @@ class SniperEngine:
         """Socket-side callback: enqueue and return. No analytics here."""
         for ev in events:
             self.bus.publish(ev)
+
+    def active_venues(self) -> List[str]:
+        """Venues currently trusted to carry a live feed."""
+        now = time.time()
+        live = [v for v in self.adapters if self.venue_blocked_until.get(v, 0) < now]
+        return live or list(self.adapters)
+
+    def _replan_streams(self) -> None:
+        self.router.plan(self.watchlist.symbols, self.watchlist.listings,
+                         self.active_venues())
+
+    def _note_starvation(self, symbol: str, venue: str) -> None:
+        """
+        A context that received no trades tells us something about the venue,
+        not just the symbol.
+
+        If one venue keeps starving its symbols while another is delivering,
+        the network is blocking that venue's feed - re-arming the same symbols
+        on it forever just burns request weight on a loop. Streaming is moved
+        to the venue that works; the blocked one stays in use for REST history,
+        which is a different port and usually unaffected.
+        """
+        self.venue_starved[venue] += 1
+        self.starve_count[symbol] += 1
+        healthy = [v for v in self.adapters
+                   if v != venue and self.venue_trades[v] > 0
+                   and self.venue_blocked_until.get(v, 0) < time.time()]
+        if not healthy or self.venue_starved[venue] < self.cfg.venue_starve_threshold:
+            return
+        self.venue_blocked_until[venue] = time.time() + self.cfg.venue_block_minutes * 60
+        self.venue_starved[venue] = 0
+        log.warning("%s websocket feed delivered no trades for %d armed symbols while "
+                    "%s is working - routing all streams to %s for %d minutes "
+                    "(%s is still used for candle history over REST)",
+                    venue, self.cfg.venue_starve_threshold, "/".join(healthy),
+                    "/".join(healthy), self.cfg.venue_block_minutes, venue)
+        self._replan_streams()
+
+    def _viable_under_trend(self, zone: Zone, symbol: str) -> bool:
+        """
+        Would this setup be allowed to fire at all, given the 4H trend?
+
+        Arming costs a full seed and holds a slot for ninety minutes. There is
+        no point spending either on a zone the trend policy will refuse no
+        matter how good the order flow turns out to be.
+        """
+        cfg = self.cfg
+        trend = self.trend.get(symbol, "range")
+        if zone.direction == "LONG":
+            conflict = "hard" if trend == "strong_down" else ("soft" if trend == "down" else "none")
+        else:
+            conflict = "hard" if trend == "strong_up" else ("soft" if trend == "up" else "none")
+        if conflict == "none":
+            return True
+        if conflict == "hard" and cfg.respect_htf_trend:
+            return False
+        if cfg.counter_trend_policy == "block":
+            return False
+        if cfg.counter_trend_policy == "strict" and zone.grade != "A+":
+            return False
+        return True
 
     def _ws_usable(self) -> bool:
         """Has any websocket transport shown a sign of life?"""
@@ -586,8 +678,13 @@ class SniperEngine:
         # a context whose feed died and cannot be revived over REST is a
         # zombie: it holds memory and can only ever score frozen data
         if not ctx.flow_fresh(self.cfg.max_flow_age_sec * 3):
+            venue = ctx.exchange
             await self._disarm(symbol, f"no flow data for {int(ctx.flow_age)}s")
-            self.cooldown[symbol] = time.time() + 600
+            self._note_starvation(symbol, venue)
+            # back off further each time rather than re-arming on a 12 minute
+            # loop: every retry costs a full seed (trades, klines, depth)
+            penalty = min(3600, 600 * (2 ** min(self.starve_count[symbol] - 1, 3)))
+            self.cooldown[symbol] = time.time() + penalty
             return
 
         if self.paused or self.monitor.count >= self.cfg.max_active_trades:
@@ -630,22 +727,31 @@ class SniperEngine:
         while not self._stop.is_set():
             await asyncio.sleep(self.cfg.flow_poll_sec)
             try:
+                # Trigger on whichever clock is stale, not just the socket's.
+                #
+                # feed_age counts ANY event; flow_age counts trades only. A
+                # stream delivering depth and klines but no trades looks alive
+                # by the first measure and dead by the second - which is the
+                # exact state that starves a context to death while the rescue
+                # that exists for it never fires.
+                idle = self.cfg.ws_flow_idle_timeout_sec
                 stalled = [
-                    (sym, ctx) for sym, ctx in self.armed.items()
-                    if ctx.seeded and ctx.feed_age > self.cfg.ws_flow_idle_timeout_sec
+                    (sym, ctx) for sym, ctx in list(self.armed.items())
+                    if ctx.seeded and (ctx.feed_age > idle or ctx.flow_age > idle)
                 ]
                 if not stalled:
                     continue
                 # oldest data first, capped so a dead network cannot burn the
                 # whole weight budget on order-flow polling
-                stalled.sort(key=lambda kv: -kv[1].flow_age)
+                stalled.sort(key=lambda kv: -max(kv[1].flow_age, kv[1].feed_age))
                 for symbol, ctx in stalled[: self.cfg.max_armed_fallback]:
                     if symbol not in self.armed:
                         continue
                     adapter = self.adapters.get(ctx.exchange) or self.history
                     got = await ctx.poll_rest(adapter, self.history)
-                    log.info("REST flow poll %s (ws silent %.0fs, new trades: %s)",
-                             symbol, ctx.feed_age, "yes" if got else "none")
+                    log.info("REST flow poll %s via %s (ws idle %.0fs, trades idle %.0fs, "
+                             "new trades: %s)", symbol, ctx.exchange, ctx.feed_age,
+                             ctx.flow_age, "yes" if got else "none")
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001
@@ -744,9 +850,14 @@ class SniperEngine:
             "markprice_age": self.mark.describe_staleness() if self.mark else "disabled",
             "price_source": self.price_source,
             "price_symbols": len(self.prices),
+            "stale_prices": len([s for s in self.monitor.symbols()
+                                 if self.prices.age(s) > self.cfg.price_max_age_sec]),
             "rest_price_symbols": len(self.prices),
             "flow_streams": len(self.streams),
             "assignment": self.router.summary(),
+            "venue_trades": dict(self.venue_trades),
+            "venue_blocked": [v for v in self.adapters
+                              if self.venue_blocked_until.get(v, 0) > time.time()],
             "feed": feed,
             "reconnects": (self.mark.reconnects if self.mark else 0)
                           + sum(s.reconnects for s in self.streams.values()),
@@ -809,6 +920,21 @@ class SniperEngine:
             if cmd == "pnl":
                 return fmt.pnl_message(perf, period, breakdown)
             return fmt.report_message(perf, period, breakdown, self._engine_stats())
+
+        if cmd == "why":
+            if not args:
+                armed = list(self.armed)
+                return ("Usage: <code>/why BTCUSDT</code>\nArmed now: "
+                        + (", ".join(armed) if armed else "nothing")) 
+            symbol = args[0].upper()
+            if not symbol.endswith(self.cfg.quote_asset):
+                symbol += self.cfg.quote_asset
+            ctx = self.armed.get(symbol)
+            if ctx is None:
+                return (f"{symbol} is not armed. Use /stats to see what is, "
+                        f"or /zones {symbol} for its zone map.")
+            decision = evaluate(ctx, self.cfg, self.trend.get(symbol, "range"))
+            return fmt.why_message(ctx, decision, self.trend.get(symbol, "range"))
 
         if cmd == "stats":
             return fmt.stats_message(self._engine_stats(),

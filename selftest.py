@@ -727,6 +727,93 @@ def test_institutional(ctx, zone) -> bool:
     return ok
 
 
+def test_signal_health(ctx, zone) -> bool:
+    """
+    The gates must reject bad setups without strangling good ones. Each of
+    these was a live bug that silently suppressed valid signals.
+    """
+    from core.orderflow import FootprintBook
+
+    # 1. absorption measured over the retention window instead of a recent one
+    b = FootprintBook(0.01, 100.0, 60, 90, 60)
+    ts = 1_700_000_000_000
+
+    def push(p, q, buy, gap=300):
+        nonlocal ts
+        b.add(p, q, buy, ts)
+        ts += gap
+
+    for i in range(700):                       # an hour of unrelated drift
+        push(105 - i * 0.0057, random.uniform(1, 3), i % 3 != 0, 5000)
+    for i in range(200):                       # old heavy selling, long gone
+        push(101 + random.choice([0, 0.01, 0.02]), random.uniform(8, 15), False, 1500)
+    for i in range(300):                       # the sweep we actually care about
+        push(99.90 + random.choice([0, 0.01, 0.02, 0.03]), random.uniform(9, 18), False, 1200)
+    price = 99.95
+    while price < 100.6:                       # absorbed and reclaimed
+        for _ in range(8):
+            push(price, random.uniform(4, 9), True, 400)
+        price += 0.05
+
+    wide = b.absorption("LONG", SETTINGS.absorption_vol_mult,
+                        SETTINGS.absorption_efficiency, 90 * 60)
+    # the window a sweep 8 minutes ago would produce
+    anchored = b.absorption("LONG", SETTINGS.absorption_vol_mult,
+                            SETTINGS.absorption_efficiency, 8 * 60)
+    ok = check("absorption anchored to the sweep is not diluted by old price action",
+               anchored["found"] and not wide["found"]
+               and anchored["recovery"] > wide["recovery"] * 2,
+               f"anchored: found (recovery {anchored['recovery']}) · "
+               f"90min retention: missed (recovery {wide['recovery']})")
+    ok &= check("the absorption window sizes itself to the sweep",
+                0 < (evaluate(ctx, SETTINGS, "range").details.get("absorption_window_sec") or 0)
+                <= SETTINGS.flow_analysis_min * 60,
+                f"{evaluate(ctx, SETTINGS, 'range').details.get('absorption_window_sec')}s "
+                f"(cap {SETTINGS.flow_analysis_min * 60}s)")
+
+    # 2. the sweep must be matched against structure from its own timeframe
+    maps = {tf: ctx.liquidity_for(tf) for tf in
+            (SETTINGS.ltf_fast, SETTINGS.ltf_slow, SETTINGS.ltf_mid)}
+    ok &= check("a structural map exists per timeframe",
+                all(m is not None for m in maps.values())
+                and maps[SETTINGS.ltf_fast] is not maps[SETTINGS.ltf_mid],
+                f"{len(set(id(m) for m in maps.values()))} distinct maps")
+
+    decision = evaluate(ctx, SETTINGS, "range")
+    ok &= check("sweep resolves to a structural level on its own timeframe",
+                bool((decision.details.get("sweep") or {}).get("structural")))
+
+    # 3. the counter-trend cost must be charged once, not twice
+    with_trend = evaluate(ctx, SETTINGS, "range")
+    against = evaluate(ctx, SETTINGS, "down")
+    ok &= check("counter-trend cost is charged once, not against score and bar both",
+                abs(with_trend.confidence - against.confidence) < 1e-6,
+                f"range {with_trend.confidence} vs down {against.confidence}")
+
+    # 4. a fully evidenced counter-trend reversal must be reachable
+    original = SETTINGS.sweep_fresh_bars
+    try:
+        SETTINGS.sweep_fresh_bars = 5
+        fresh = evaluate(ctx, SETTINGS, "down")
+        ok &= check("counter-trend passes when the evidence is genuinely there",
+                    fresh.passed, str(fresh.blockers[:2]))
+    finally:
+        SETTINGS.sweep_fresh_bars = original
+
+    stale = evaluate(ctx, SETTINGS, "down")
+    ok &= check("counter-trend without a fresh sweep is still refused",
+                not stale.passed and any("counter_trend" in b for b in stale.blockers),
+                str(stale.blockers[:1]))
+    hard = evaluate(ctx, SETTINGS, "strong_down")
+    ok &= check("a strong opposing trend is refused outright",
+                not hard.passed and "against_4h_trend" in hard.blockers)
+
+    # 5. lower-timeframe bias must cost confidence, not veto the trade
+    ok &= check("opposed lower timeframes no longer hard-block a reversal",
+                "all_lower_timeframes_opposed" not in with_trend.blockers)
+    return ok
+
+
 def test_liquidity_gate(ctx) -> bool:
     """A setup with nowhere to go must not fire, however clean the flow is."""
     heat_bids, heat_asks = dict(ctx.heatmap.bids), dict(ctx.heatmap.asks)
@@ -777,6 +864,94 @@ def test_universe() -> bool:
     return ok
 
 
+async def _test_starvation(zone) -> bool:
+    """
+    The exact failure seen live: a stream that delivers depth and klines but
+    no trades, so the context starves while looking perfectly connected, and
+    the same symbols re-arm on the same broken venue every twelve minutes.
+    """
+    import os
+    import tempfile
+
+    from core.engine import SniperEngine
+
+    original_db = SETTINGS.db_path
+    original = (SETTINGS.flow_poll_sec, SETTINGS.ws_flow_idle_timeout_sec,
+                SETTINGS.max_flow_age_sec)
+    SETTINGS.db_path = os.path.join(tempfile.mkdtemp(prefix="sniper-starve-"), "s.db")
+    SETTINGS.flow_poll_sec, SETTINGS.ws_flow_idle_timeout_sec = 1, 2
+    SETTINGS.max_flow_age_sec = 3
+    polled: List[str] = []
+
+    class _Adapter:
+        name = "binance"
+        has_taker_volume = True
+
+        async def start(self):
+            return None
+
+        async def close(self):
+            return None
+
+        async def recent_trades(self, s, l=1000):
+            polled.append(s)
+            return []
+
+        async def klines(self, s, i, l, bulk=False):
+            return build_ltf(zone, 60_000, 120)
+
+        async def depth(self, s, l=50):
+            return DepthEvent("binance", s, [(1.0, 5.0)], [(2.0, 5.0)],
+                              int(time.time() * 1000))
+
+    engine = SniperEngine(SETTINGS)
+    engine.adapters = {"binance": _Adapter(), "bybit": _Adapter()}
+    engine.history = engine.adapters["binance"]
+    await engine.db.init()
+    try:
+        ctx = ArmedContext("BLESSUSDT", zone, SETTINGS, 0.01, 2, zone.mid, "binance")
+        ctx.seeded = True
+        ctx.armed_at = time.time() - 300
+        ctx.last_flow_ts = time.time() - 60          # trades stopped a minute ago
+        engine.armed["BLESSUSDT"] = ctx
+        task = asyncio.create_task(engine._loop_flow_fallback())
+
+        # the socket is alive - depth keeps arriving, trades never do
+        for _ in range(4):
+            ctx.on_depth(DepthEvent("binance", "BLESSUSDT", [(1.0, 5.0)],
+                                    [(2.0, 5.0)], int(time.time() * 1000)))
+            await asyncio.sleep(0.6)
+        task.cancel()
+
+        ok = check("a stream with depth but no trades still triggers the REST rescue",
+                   bool(polled) and ctx.flow_age < 5,
+                   f"{len(polled)} rescue polls, flow age {ctx.flow_age:.1f}s")
+
+        # a venue that starves its symbols while the other works gets bypassed
+        engine.venue_trades["bybit"] = 500
+        engine.watchlist.symbols = ["BLESSUSDT"]
+        engine.watchlist.listings = {"binance": {"BLESSUSDT"}, "bybit": {"BLESSUSDT"}}
+        for i in range(SETTINGS.venue_starve_threshold):
+            engine._note_starvation(f"SYM{i}USDT", "binance")
+        ok &= check("a venue that delivers no trades is dropped from streaming",
+                    "binance" not in engine.active_venues()
+                    and "bybit" in engine.active_venues(),
+                    f"active: {engine.active_venues()}")
+        ok &= check("candle history still uses the blocked venue over REST",
+                    engine.history.name == "binance")
+
+        engine.starve_count["BLESSUSDT"] = 3
+        penalty = min(3600, 600 * (2 ** min(engine.starve_count["BLESSUSDT"] - 1, 3)))
+        ok &= check("repeat starvation backs off instead of looping every 12 minutes",
+                    penalty >= 2400, f"{penalty//60} minute cooldown on the 3rd failure")
+    finally:
+        (SETTINGS.flow_poll_sec, SETTINGS.ws_flow_idle_timeout_sec,
+         SETTINGS.max_flow_age_sec) = original
+        SETTINGS.db_path = original_db
+        await engine.db.close()
+    return ok
+
+
 def test_formatting(signal) -> bool:
     from notifier import formatter as fmt
     msg = fmt.signal_message(signal, 1, " · fresh")
@@ -817,19 +992,25 @@ def run_selftest() -> bool:
 
     test_liquidity_gate(ctx)
 
-    print("\n\033[1m7. Database and trade monitor\033[0m")
+    print("\n\033[1m7. Signal health (windows, timeframes, trend gating)\033[0m")
+    test_signal_health(ctx, zone)
+
+    print("\n\033[1m8. Database and trade monitor\033[0m")
     asyncio.run(_test_db(signal))
 
-    print("\n\033[1m8. Multi-exchange feed\033[0m")
+    print("\n\033[1m9. Multi-exchange feed\033[0m")
     asyncio.run(_test_multi_exchange())
 
-    print("\n\033[1m9. Universe filtering\033[0m")
+    print("\n\033[1m10. Feed starvation and venue failover\033[0m")
+    asyncio.run(_test_starvation(zone))
+
+    print("\n\033[1m11. Universe filtering\033[0m")
     test_universe()
 
-    print("\n\033[1m10. Telegram rendering\033[0m")
+    print("\n\033[1m12. Telegram rendering\033[0m")
     test_formatting(signal)
 
-    print("\n\033[1m11. Resilience (rate limiter, dead feeds, hung commands)\033[0m")
+    print("\n\033[1m13. Resilience (rate limiter, dead feeds, hung commands)\033[0m")
     asyncio.run(_test_resilience(zone))
 
     return _summary()
