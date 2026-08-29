@@ -13,6 +13,10 @@ from ..utils import get_logger, safe_float
 log = get_logger("exchange")
 
 
+class PermanentRequestError(RuntimeError):
+    """A 4xx: retrying cannot help and would only waste request weight."""
+
+
 class HttpClient:
     """Small retrying JSON client shared by the adapters."""
 
@@ -58,9 +62,17 @@ class HttpClient:
                         raise RuntimeError(f"{self.name} {resp.status}")
                     if resp.status != 200:
                         body = await resp.text()
+                        if 400 <= resp.status < 500:
+                            # a client error will not fix itself: an unlisted
+                            # symbol stays unlisted. Retrying burns request
+                            # weight three times over for nothing.
+                            raise PermanentRequestError(
+                                f"http {resp.status}: {body[:180]}")
                         raise RuntimeError(f"http {resp.status}: {body[:180]}")
                     return await resp.json()
             except asyncio.CancelledError:
+                raise
+            except PermanentRequestError:
                 raise
             except Exception as exc:  # noqa: BLE001
                 last = exc

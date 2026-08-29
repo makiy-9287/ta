@@ -10,12 +10,18 @@ it just has no choice of feed.
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from typing import Dict, List, Set
 
 from .utils import fmt_usd, get_logger
 
 log = get_logger("watchlist")
+
+# Symbols must look like an ordinary crypto perpetual. This rejects listings
+# whose ticker is not plain ASCII uppercase - meme contracts with CJK names,
+# for instance - which have no business in an order-flow strategy.
+SYMBOL_RE = re.compile(r"^[A-Z0-9]{2,20}$")
 
 
 class WatchlistManager:
@@ -50,6 +56,28 @@ class WatchlistManager:
         self.listings = listings
         self.meta = meta
 
+    def _acceptable(self, symbol: str) -> str:
+        """Returns a rejection reason, or "" if the symbol is tradable."""
+        base = symbol[: -len(self.cfg.quote_asset)] if symbol.endswith(self.cfg.quote_asset) \
+            else symbol
+        if not SYMBOL_RE.match(base):
+            return "non-standard ticker"
+        if base in self.cfg.excluded_underlyings:
+            # tokenised metals, equities and pre-IPO products trade on a
+            # completely different clock: thin books, gapped sessions, and
+            # order flow driven by an underlying this engine cannot see
+            return "non-crypto underlying"
+        if symbol in self.cfg.blacklist_set:
+            return "blacklisted"
+        if self.cfg.require_history_listing:
+            history = self.listings.get(self.cfg.history_exchange, set())
+            if history and symbol not in history:
+                # candle history (and therefore every historical delta and CVD
+                # figure) comes from that venue; without it the symbol can
+                # never be scored, and trying wastes request weight
+                return f"not listed on {self.cfg.history_exchange}"
+        return ""
+
     async def refresh(self) -> List[str]:
         if not self.meta:
             await self.load_instruments()
@@ -72,12 +100,22 @@ class WatchlistManager:
                 if r.get("price"):
                     prices.setdefault(sym, r["price"])
 
-        blacklist = self.cfg.blacklist_set
-        rows = [{"symbol": s, "quote_volume": v, "price": prices.get(s, 0.0)}
-                for s, v in volumes.items()
-                if v >= self.cfg.min_quote_volume and s not in blacklist]
+        rows = []
+        rejected: Dict[str, int] = {}
+        for symbol, volume in volumes.items():
+            if volume < self.cfg.min_quote_volume:
+                continue
+            reason = self._acceptable(symbol)
+            if reason:
+                rejected[reason] = rejected.get(reason, 0) + 1
+                continue
+            rows.append({"symbol": symbol, "quote_volume": volume,
+                         "price": prices.get(symbol, 0.0)})
         rows.sort(key=lambda r: r["quote_volume"], reverse=True)
         rows = rows[: self.cfg.max_watchlist]
+        if rejected:
+            log.info("filtered out %d symbols: %s", sum(rejected.values()),
+                     ", ".join(f"{n} {why}" for why, n in sorted(rejected.items())))
 
         self.symbols = [r["symbol"] for r in rows]
         self.last_volume = {r["symbol"]: r["quote_volume"] for r in rows}

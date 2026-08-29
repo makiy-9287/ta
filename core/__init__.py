@@ -1,2 +1,2 @@
 """Core analytics and orchestration for the Sniper Flow engine."""
-__version__ = "2.0.0"
+__version__ = "2.0.1"

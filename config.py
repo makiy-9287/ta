@@ -75,6 +75,17 @@ class Settings:
     max_watchlist: int = field(default_factory=lambda: _i("MAX_WATCHLIST", 220))
     quote_asset: str = field(default_factory=lambda: _s("QUOTE_ASSET", "USDT"))
     blacklist: str = field(default_factory=lambda: _s("SYMBOL_BLACKLIST", ""))
+    require_history_listing: bool = field(
+        default_factory=lambda: _b("REQUIRE_HISTORY_LISTING", True))
+    # Tokenised metals, equities and pre-IPO products. They are quoted in USDT
+    # and pass every volume filter, but they track an underlying this engine
+    # cannot see, and their books are far too thin for footprint work.
+    # Extend this list as venues add more of them.
+    exclude_underlyings: str = field(default_factory=lambda: _s(
+        "EXCLUDE_UNDERLYINGS",
+        "XAU,XAG,XAUT,PAXG,XPT,XPD,WTI,OIL,BRENT,SPX,SPX500,NDX,NAS100,DJI,US30,"
+        "DAX,NIKKEI,SPCX,OPENAI,MRVL,NVDA,TSLA,AAPL,MSFT,META,AMZN,GOOGL,GOOG,"
+        "NFLX,AMD,INTC,COIN,HOOD,MSTR,PLTR,GME,AMC,BABA,IBIT,CRCL"))
 
     # ---------------------------------------------------------------- candles
     htf_interval: str = field(default_factory=lambda: _s("HTF_INTERVAL", "4h"))
@@ -90,10 +101,12 @@ class Settings:
     zone_max_atr_width: float = field(default_factory=lambda: _f("ZONE_MAX_ATR_WIDTH", 1.30))
     score_a_plus: int = field(default_factory=lambda: _i("SCORE_A_PLUS", 80))
     score_a: int = field(default_factory=lambda: _i("SCORE_A", 70))
-    max_zones_per_symbol: int = field(default_factory=lambda: _i("MAX_ZONES_PER_SYMBOL", 8))
+    max_zones_per_symbol: int = field(default_factory=lambda: _i("MAX_ZONES_PER_SYMBOL", 5))
     max_zone_tests: int = field(default_factory=lambda: _i("MAX_ZONE_TESTS", 3))
-    structural_min_strength: float = field(default_factory=lambda: _f("STRUCTURAL_MIN_STRENGTH", 0.55))
+    structural_min_strength: float = field(default_factory=lambda: _f("STRUCTURAL_MIN_STRENGTH", 0.60))
     equal_level_atr_tol: float = field(default_factory=lambda: _f("EQUAL_LEVEL_ATR_TOL", 0.12))
+    structural_major_strength: float = field(
+        default_factory=lambda: _f("STRUCTURAL_MAJOR_STRENGTH", 0.70))
     range_position_guard: float = field(default_factory=lambda: _f("RANGE_POSITION_GUARD", 0.45))
     respect_htf_trend: bool = field(default_factory=lambda: _b("RESPECT_HTF_TREND", True))
     counter_trend_policy: str = field(default_factory=lambda: _s("COUNTER_TREND_POLICY", "strict"))
@@ -101,7 +114,7 @@ class Settings:
 
     # ---------------------------------------------------------------- proximity / arming
     proximity_interval_sec: int = field(default_factory=lambda: _i("PROXIMITY_INTERVAL_SEC", 300))
-    arm_buffer_zone_frac: float = field(default_factory=lambda: _f("ARM_BUFFER_ZONE_FRAC", 0.40))
+    arm_buffer_zone_frac: float = field(default_factory=lambda: _f("ARM_BUFFER_ZONE_FRAC", 0.25))
     max_armed_symbols: int = field(default_factory=lambda: _i("MAX_ARMED_SYMBOLS", 18))
     arm_ttl_minutes: int = field(default_factory=lambda: _i("ARM_TTL_MINUTES", 90))
     arm_warmup_sec: int = field(default_factory=lambda: _i("ARM_WARMUP_SEC", 90))
@@ -201,6 +214,7 @@ class Settings:
     # Some networks accept the WebSocket handshake and then deliver nothing at
     # all. These control how fast that is detected and how the engine copes.
     ws_idle_timeout_sec: int = field(default_factory=lambda: _i("WS_IDLE_TIMEOUT_SEC", 45))
+    markprice_give_up: int = field(default_factory=lambda: _i("MARKPRICE_GIVE_UP_AFTER", 8))
     ws_flow_idle_timeout_sec: int = field(default_factory=lambda: _i("WS_FLOW_IDLE_TIMEOUT_SEC", 120))
     max_flow_age_sec: int = field(default_factory=lambda: _i("MAX_FLOW_AGE_SEC", 240))
     rest_fallback: bool = field(default_factory=lambda: _b("REST_FALLBACK", True))
@@ -211,6 +225,10 @@ class Settings:
     command_timeout_sec: int = field(default_factory=lambda: _i("COMMAND_TIMEOUT_SEC", 45))
 
     # ------------------------------------------------------------------ helpers
+    @property
+    def excluded_underlyings(self) -> set:
+        return {s.strip().upper() for s in self.exclude_underlyings.split(",") if s.strip()}
+
     @property
     def exchange_list(self) -> list:
         return [e.strip().lower() for e in self.exchanges.split(",") if e.strip()]

@@ -442,12 +442,21 @@ async def _test_db(signal) -> bool:
     return ok
 
 
+async def _swallow(coro):
+    try:
+        await coro
+    except Exception:
+        pass
+
+
 async def _test_resilience(zone) -> bool:
     """
     Regressions for the failure modes that silently killed a live deployment:
     a latched rate limiter, a websocket that connects and then says nothing,
     and a command handler that blocks the Telegram poll loop.
     """
+    import logging
+
     from core.rate_limiter import WeightLimiter
     from notifier.telegram import TelegramBot
 
@@ -517,6 +526,34 @@ async def _test_resilience(zone) -> bool:
     ok &= check("corrupt timestamps rejected without destroying the book",
                 intact == 400 and fb.total_trades == 401 and fb.rejected_ts == 2,
                 f"{fb.total_trades} trades kept, {fb.rejected_ts} rejected")
+
+    # 2e. the budget must complain quietly, not once per second per task
+    lim5 = WeightLimiter(100, name="test")
+    for _ in range(100):
+        lim5._events.append((time.time(), 1))
+    warnings = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record):
+            warnings.append(record.getMessage())
+
+    rl_log = logging.getLogger("ratelimit")
+    handler = _Capture()
+    rl_log.addHandler(handler)
+    try:
+        # five tasks contending, exactly as five zone builds would
+        await asyncio.gather(*[
+            asyncio.wait_for(_swallow(lim5.acquire(50)), timeout=2) for _ in range(5)
+        ], return_exceptions=True)
+    finally:
+        rl_log.removeHandler(handler)
+    ok &= check("budget contention logs at most once, not once per task per second",
+                len(warnings) <= 1, f"{len(warnings)} log lines from 5 contending tasks")
+
+    # 2f. a 4xx must not be retried - it burns weight for a guaranteed failure
+    from core.exchanges.base import PermanentRequestError
+    ok &= check("client errors are a distinct, non-retryable failure",
+                issubclass(PermanentRequestError, RuntimeError))
 
     # 3. a silent socket must be detected rather than treated as healthy
     from core.ws import MarkPriceStream
@@ -720,6 +757,26 @@ def test_liquidity_gate(ctx) -> bool:
     return ok
 
 
+def test_universe() -> bool:
+    """Junk listings must never reach the strategy."""
+    from core.watchlist import WatchlistManager
+    w = WatchlistManager({}, None, SETTINGS)
+    w.listings = {"binance": {"BTCUSDT", "ETHUSDT", "TRUMPUSDT"},
+                  "bybit": {"BTCUSDT", "MRVLUSDT", "SPCXUSDT", "XAGUSDT",
+                            "\u6211\u8e0f\u9a6c\u6765\u4e86USDT", "MUUSDT"}}
+    accepted = [s for s in ("BTCUSDT", "ETHUSDT", "TRUMPUSDT") if not w._acceptable(s)]
+    ok = check("ordinary crypto perpetuals are accepted", len(accepted) == 3, str(accepted))
+    ok &= check("tokenised equities and metals are rejected",
+                all(w._acceptable(s) for s in ("MRVLUSDT", "SPCXUSDT", "XAGUSDT")),
+                w._acceptable("MRVLUSDT"))
+    ok &= check("non-ASCII tickers are rejected",
+                bool(w._acceptable("\u6211\u8e0f\u9a6c\u6765\u4e86USDT")),
+                w._acceptable("\u6211\u8e0f\u9a6c\u6765\u4e86USDT"))
+    ok &= check("symbols without candle history are rejected",
+                bool(w._acceptable("MUUSDT")), w._acceptable("MUUSDT"))
+    return ok
+
+
 def test_formatting(signal) -> bool:
     from notifier import formatter as fmt
     msg = fmt.signal_message(signal, 1, " · fresh")
@@ -766,10 +823,13 @@ def run_selftest() -> bool:
     print("\n\033[1m8. Multi-exchange feed\033[0m")
     asyncio.run(_test_multi_exchange())
 
-    print("\n\033[1m9. Telegram rendering\033[0m")
+    print("\n\033[1m9. Universe filtering\033[0m")
+    test_universe()
+
+    print("\n\033[1m10. Telegram rendering\033[0m")
     test_formatting(signal)
 
-    print("\n\033[1m10. Resilience (rate limiter, dead feeds, hung commands)\033[0m")
+    print("\n\033[1m11. Resilience (rate limiter, dead feeds, hung commands)\033[0m")
     asyncio.run(_test_resilience(zone))
 
     return _summary()

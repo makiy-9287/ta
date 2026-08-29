@@ -55,10 +55,24 @@ All USDT perpetuals with **24h quote volume above $20M** (`MIN_QUOTE_VOLUME_USD`
 Thinner books can't produce readable footprints, so they aren't worth the
 bandwidth.
 
-### 2. Zone map — every 4 hours
+Volume alone isn't enough of a filter. Venues list tokenised equities, metals
+and pre-IPO products quoted in USDT — `MRVLUSDT`, `XAGUSDT`, `SPCXUSDT` — which
+clear any volume threshold while tracking an underlying this engine cannot see,
+on books far too thin for footprint work. Those are excluded by
+`EXCLUDE_UNDERLYINGS`, along with non-ASCII tickers and anything the history
+venue doesn't list (no klines means no scoring, ever).
+
+### 2. Zone map — rolling, continuous
 
 600 × 4H and 600 × 1H candles per symbol. Fractal pivots are clustered by ATR
-tolerance into zone boxes, then scored out of 100:
+tolerance into zone boxes, then scored out of 100.
+
+Rebuilding the whole watchlist at once costs ~1300 request weight and saturates
+the budget for two minutes. Zones move on the scale of hours, so instead the
+**stalest symbol is refreshed every few seconds** — identical work, spread into
+about 5 weight/min that nothing else ever notices.
+
+The scoring rubric:
 
 | Section | Points | What earns them |
 |---|---|---|

@@ -405,7 +405,11 @@ def score_zone(zone: Zone, ctx: ZoneContext, mtf_zones: List[Zone], cfg,
 
     # --- A. higher-timeframe confluence (30) -------------------------------
     structural = zone.flags.get("structural")
-    major = zone.members >= 2 or bool(structural)
+    # a labelled swing only counts as "major" when it is genuinely decisive -
+    # otherwise every HL on the chart is handed the full 20 points and the
+    # zone map floods
+    strong_structure = float(zone.flags.get("structural_strength") or 0) >= cfg.structural_major_strength
+    major = zone.members >= 2 or (bool(structural) and strong_structure)
     a_pts = 20 if major else 12
     flags["htf_major"] = major
     mtf_hit = any(z.kind == zone.kind and z.overlaps(zone) for z in mtf_zones)

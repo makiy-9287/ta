@@ -28,7 +28,9 @@ WINDOW = 60.0
 
 
 class WeightLimiter:
-    def __init__(self, budget_per_min: int = 1100, bulk_share: float = 0.65):
+    def __init__(self, budget_per_min: int = 1100, bulk_share: float = 0.65,
+                 name: str = ""):
+        self.name = name
         self.budget = max(60, int(budget_per_min))
         # background work (the periodic zone rebuild) may only ever consume
         # part of the budget, so latency-sensitive calls - prices, arming,
@@ -40,6 +42,7 @@ class WeightLimiter:
         self._reported_at = 0.0
         self._banned_until = 0.0
         self._waits = 0
+        self._last_warn = 0.0
 
     def _prune(self, now: float) -> None:
         cutoff = now - WINDOW
@@ -116,11 +119,18 @@ class WeightLimiter:
             step = min(wait, 5.0)
             waited += step
             self._waits += 1
-            if waited >= 20.0 and self._waits % 8 == 0:
-                log.warning("waiting %.0fs on the weight budget "
-                            "(effective=%d cap=%d reported=%d age=%.0fs)",
-                            waited, self._effective(time.time()), cap, self._reported_weight,
-                            time.time() - self._reported_at if self._reported_at else -1)
+            # Throttle by TIME, not by a counter. Several tasks wait on the
+            # budget at once, so a modulo counter fires from whichever task
+            # happens to tick - producing a warning every second from a
+            # different coroutine. One line every 30 seconds is enough to know
+            # the budget is tight.
+            now = time.time()
+            if waited >= 15.0 and (now - self._last_warn) >= 30.0:
+                self._last_warn = now
+                log.info("%s throttled: %.0fs waiting (effective=%d cap=%d age=%.0fs) "
+                         "- background work is being paced, this is normal",
+                         self.name or "budget", waited, self._effective(now), cap,
+                         (now - self._reported_at) if self._reported_at else -1)
             await asyncio.sleep(step)
 
     def sync_from_header(self, used_weight: int) -> None:

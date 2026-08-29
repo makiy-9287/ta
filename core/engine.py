@@ -50,7 +50,7 @@ log = get_logger("engine")
 class SniperEngine:
     def __init__(self, cfg: Settings):
         self.cfg = cfg
-        self.limiter = WeightLimiter(cfg.weight_budget, cfg.bulk_weight_share)
+        self.limiter = WeightLimiter(cfg.weight_budget, cfg.bulk_weight_share, name="binance")
         self.limiters = {"binance": self.limiter}
 
         # one adapter per configured venue; each gets its own budget because
@@ -62,7 +62,7 @@ class SniperEngine:
                 log.warning("unknown exchange '%s' - ignoring", name)
                 continue
             limiter = self.limiter if name == "binance" else \
-                WeightLimiter(cfg.bybit_budget, cfg.bulk_weight_share)
+                WeightLimiter(cfg.bybit_budget, cfg.bulk_weight_share, name=name)
             self.limiters[name] = limiter
             self.adapters[name] = factory(cfg, limiter)
 
@@ -83,6 +83,7 @@ class SniperEngine:
 
         self.zones: Dict[str, List[Zone]] = {}
         self.liquidity: Dict[str, LiquidityMap] = {}
+        self.zone_ts: Dict[str, float] = {}
         self.trend: Dict[str, str] = {}
         self.armed: Dict[str, ArmedContext] = {}
         self.streams: Dict[str, SessionStream] = {}
@@ -215,15 +216,40 @@ class SniperEngine:
                 await asyncio.sleep(60)
 
     async def _loop_zones(self) -> None:
+        """
+        Roll through the watchlist continuously instead of rebuilding it all
+        at once.
+
+        A full rebuild of 130 symbols is ~1300 request weight. Fired as a
+        burst it saturates the budget for two minutes and starves everything
+        else. Zones move on the scale of hours, so refreshing the single
+        stalest symbol every few seconds spreads exactly the same work into a
+        trickle the budget never notices.
+        """
+        await asyncio.sleep(30)
         while not self._stop.is_set():
+            await asyncio.sleep(self._zone_tick())
             try:
-                await asyncio.sleep(self.cfg.zone_refresh_hours * 3600)
-                await self._rebuild_zones()
+                symbol = self._stalest_symbol()
+                if symbol:
+                    await self._zones_for(symbol)
+                    self.zone_ts[symbol] = time.time()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001
-                log.exception("zone loop error: %s", exc)
-                await asyncio.sleep(120)
+                log.debug("rolling zone refresh failed: %s", exc)
+
+    def _zone_tick(self) -> float:
+        """Seconds between single-symbol refreshes to cover the whole list."""
+        n = max(1, len(self.watchlist.symbols))
+        return max(2.0, min(300.0, self.cfg.zone_refresh_hours * 3600.0 / n))
+
+    def _stalest_symbol(self) -> Optional[str]:
+        candidates = [s for s in self.watchlist.symbols
+                      if s not in self.armed and not self.monitor.has(s)]
+        if not candidates:
+            return None
+        return min(candidates, key=lambda s: self.zone_ts.get(s, 0.0))
 
     async def _loop_proximity(self) -> None:
         await asyncio.sleep(5)
@@ -279,7 +305,17 @@ class SniperEngine:
                     self.signals_today = 0
                 log.info("housekeeping: %.0f MB rss, %d objects freed, armed=%d, weight=%s",
                          rss_mb(), freed, len(self.armed), self.limiter.snapshot())
-                if self.mark and (not self.mark.alive or self.mark.stale_for > 120):
+                if self.mark and not self.mark.last_msg_ts \
+                        and self.mark.silent_drops >= self.cfg.markprice_give_up:
+                    # this host cannot receive the mark price stream. Every
+                    # further attempt is noise: prices already come from REST
+                    # and from the venues whose sockets do work.
+                    log.warning("mark price stream abandoned after %d silent endpoints - "
+                                "prices will come from REST and live trades",
+                                self.mark.silent_drops)
+                    await self.mark.stop()
+                    self.mark = None
+                elif self.mark and (not self.mark.alive or self.mark.stale_for > 120):
                     log.warning("mark price stream unhealthy (%s, %d reconnects, %d silent) "
                                 "- restarting; prices are coming from %s",
                                 self.mark.describe_staleness(), self.mark.reconnects,
@@ -293,23 +329,32 @@ class SniperEngine:
 
     # ============================================================ zone building
     async def _rebuild_zones(self, initial: bool = False) -> None:
+        """Initial pass over the whole watchlist, highest volume first."""
         symbols = list(self.watchlist.symbols)
         if not symbols:
             return
-        log.info("rebuilding zones for %d symbols...", len(symbols))
+        log.info("building zones for %d symbols (paced against the bulk budget, "
+                 "highest volume first)...", len(symbols))
         started = time.time()
         built = 0
+        done = 0
 
-        for batch in _batches(symbols, 5):
+        for batch in _batches(symbols, 4):
             if self._stop.is_set():
                 return
             results = await asyncio.gather(*[self._zones_for(s) for s in batch],
                                            return_exceptions=True)
             for sym, res in zip(batch, results):
+                done += 1
+                self.zone_ts[sym] = time.time()
                 if isinstance(res, Exception):
                     log.debug("zone build failed for %s: %s", sym, res)
                     continue
                 built += 1
+            if done % 25 == 0 or done == len(symbols):
+                log.info("  zones: %d/%d symbols, %d graded so far (%.0fs elapsed)",
+                         done, len(symbols), sum(len(z) for z in self.zones.values()),
+                         time.time() - started)
             await asyncio.sleep(0.05)
 
         self.zone_build_ts = time.time()
@@ -317,7 +362,8 @@ class SniperEngine:
         log.info("zones ready: %d symbols, %d graded zones in %.0fs",
                  built, total, time.time() - started)
         if initial and total == 0:
-            log.warning("no zones passed the %d point threshold on the first pass", self.cfg.score_a)
+            log.warning("no zones passed the %d point threshold on the first pass",
+                        self.cfg.score_a)
 
     async def _zones_for(self, symbol: str) -> None:
         cfg = self.cfg

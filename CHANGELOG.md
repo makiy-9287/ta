@@ -1,5 +1,41 @@
 # Changelog
 
+## 2.0.1 — from the first live 2.0 run
+
+The 2.0 feed worked: 129 symbols split binance=65 / bybit=64, and **Bybit
+websockets connected on a host that cannot reach Binance's** — exactly the
+redundancy the split was built for. Three things were wrong around it.
+
+**7. The rate limiter shouted once a second for a minute.**
+`waiting 44s... 44s... 45s...` was five concurrent zone builds each logging
+from a counter-based throttle (`_waits % 8`), so whichever task happened to
+tick produced a line. Now throttled by time: one line every 30 seconds, at
+INFO, saying plainly that background work is being paced.
+
+**8. The zone rebuild was still a burst.** 129 symbols x 2 timeframes x 600
+candles is 1290 request weight against a 715 bulk cap - two full minutes of
+saturation at every refresh. Zones move on the scale of hours, so the periodic
+rebuild is now a **rolling refresh**: the single stalest symbol is rebuilt
+every few seconds, spreading identical work into ~5 weight/min that the budget
+never notices. The initial build remains a burst by necessity, but it is paced,
+volume-ordered, logs progress instead of spam, and priority calls are served
+throughout it (measured: 240 price calls during a 120s build, none starved).
+
+**9. Junk listings reached the strategy.** The run armed `MRVLUSDT` and
+`SPCXUSDT` (tokenised equities), `XAGUSDT` and `PAXGUSDT` (metals), and a meme
+contract with a CJK ticker. They pass every volume filter but track an
+underlying the engine cannot see, on books far too thin for footprint work.
+The universe now requires a plain ASCII ticker, rejects a configurable list of
+non-crypto underlyings, and requires a listing on the history venue - without
+its klines a symbol can never be scored, and attempting it wasted weight.
+
+Also: **4xx responses are no longer retried** (an unlisted symbol stays
+unlisted; three attempts burned weight for a guaranteed failure), zone grading
+tightened so an ordinary labelled swing no longer collects the full major
+bonus (568 zones from 127 symbols put 32 symbols in a zone at once), and a
+mark price stream that has failed on every endpoint is now **abandoned** rather
+than reconnected forever.
+
 ## 2.0.0 — institutional edition
 
 Rebuilt around one question: *where is the resting liquidity, and is price
