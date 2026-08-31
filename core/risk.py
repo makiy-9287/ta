@@ -20,23 +20,47 @@ from typing import Dict, List, Optional
 from .confirm import liquidity_targets
 from .indicators import atr
 from .models import Decision, Signal
-from .utils import get_logger, now_ms
+from .utils import clamp, get_logger, now_ms
 
 log = get_logger("risk")
 
 
 def _pick_target(targets: List[dict], entry: float, risk: float, direction: str,
-                 min_r: float, used: List[float], merge_pct: float) -> Optional[dict]:
-    """Nearest liquidity pool that clears `min_r` and is not already used."""
+                 min_r: float, max_r: float, used: List[float], merge_pct: float,
+                 reach: float, prefer_strength: bool = False) -> Optional[dict]:
+    """
+    Best liquidity pool inside a REWARD WINDOW.
+
+    A minimum alone is not enough. With only a floor, the first pool clearing
+    it wins however far away it sits - which is how a target lands 119R out,
+    at a price the market would need to double to reach. Each target now has a
+    ceiling too, and an absolute reach limit derived from recent volatility, so
+    a level has to be both worth taking and plausibly reachable.
+
+    TP1 and TP2 take the NEAREST qualifying pool, because their job is to be
+    hit - TP1 in particular buys the breakeven stop. TP3 takes the STRONGEST
+    pool in its window, because its job is to be where the move actually ends.
+    """
+    window: List[dict] = []
     for t in targets:
         level = float(t["price"])
-        r = (level - entry) / risk if direction == "LONG" else (entry - level) / risk
-        if r < min_r:
+        move = (level - entry) if direction == "LONG" else (entry - level)
+        if move <= 0 or (reach > 0 and move > reach):
+            continue
+        r = move / risk
+        if r < min_r or r > max_r:
             continue
         if any(abs(level - u) / max(entry, 1e-9) < merge_pct for u in used):
             continue
-        return {**t, "r": r}
-    return None
+        window.append({**t, "r": r, "move": move})
+
+    if not window:
+        return None
+    if prefer_strength:
+        window.sort(key=lambda t: (-float(t.get("strength") or 0), t["move"]))
+    else:
+        window.sort(key=lambda t: t["move"])
+    return window[0]
 
 
 def build_signal(ctx, decision: Decision, cfg,
@@ -113,28 +137,57 @@ def build_signal(ctx, decision: Decision, cfg,
                                   "distance_pct": move / entry_ref}]
             targets.sort(key=lambda t: t["distance_pct"])
 
+    # How far price can plausibly travel from here.
+    #
+    # Measured against the 4H ATR, because that is the horizon a zone-to-zone
+    # move plays out over. Without any cap a distant 4H zone gets offered as a
+    # target however many sessions away it sits - which is how TP3 once landed
+    # 119R out, at a price the market would have had to nearly triple to reach.
+    #
+    # The cap never falls below what a viable TP3 needs, so it only ever bites
+    # on genuinely absurd targets rather than rejecting ordinary setups.
+    htf_atr = float(ctx.zone.flags.get("htf_atr") or 0.0)
+    if htf_atr <= 0:
+        mid = ctx.candles.get(cfg.ltf_mid) or []
+        htf_atr = (atr(mid, 14) * 4.0) if len(mid) >= 20 else a * 8.0
+    reach = max(htf_atr * cfg.tp_reach_atr_mult, cfg.tp3_min_r * risk * 1.15)
+    ceiling_r = min(cfg.tp3_max_r, reach / risk)
+
     sign = 1.0 if long_ else -1.0
     used: List[float] = []
     chosen: List[Optional[dict]] = []
-    for min_r in (cfg.tp1_min_r, cfg.tp2_min_r, cfg.tp3_min_r):
-        pick = _pick_target(targets, entry_ref, risk, direction, min_r, used, cfg.target_merge_pct)
+    windows = ((cfg.tp1_min_r, min(cfg.tp1_max_r, ceiling_r), False),
+               (cfg.tp2_min_r, min(cfg.tp2_max_r, ceiling_r), False),
+               (cfg.tp3_min_r, ceiling_r, True))
+    for min_r, max_r, by_strength in windows:
+        pick = _pick_target(targets, entry_ref, risk, direction, min_r, max_r,
+                            used, cfg.target_merge_pct, reach, by_strength)
         if pick:
             used.append(float(pick["price"]))
         chosen.append(pick)
 
-    tp1 = chosen[0]["price"] if chosen[0] else entry_ref + sign * cfg.tp1_r * risk
-    tp2 = chosen[1]["price"] if chosen[1] else entry_ref + sign * cfg.tp2_r * risk
-    tp3 = chosen[2]["price"] if chosen[2] else entry_ref + sign * cfg.tp3_r * risk
+    # Build the ladder in R space, then convert to prices. Doing it the other
+    # way round - clamping prices and sorting them afterwards - let a capped
+    # TP3 be shuffled into the TP1 slot at a reward below its own minimum.
+    gap = cfg.tp_min_separation_r
+    r1 = chosen[0]["r"] if chosen[0] else clamp(cfg.tp1_r, cfg.tp1_min_r,
+                                               min(cfg.tp1_max_r, ceiling_r))
+    r2 = chosen[1]["r"] if chosen[1] else clamp(cfg.tp2_r, cfg.tp2_min_r,
+                                               min(cfg.tp2_max_r, ceiling_r))
+    r3 = chosen[2]["r"] if chosen[2] else clamp(cfg.tp3_r, cfg.tp3_min_r, ceiling_r)
+    r2 = max(r2, r1 + gap)
+    r3 = max(r3, r2 + gap)
+    if r3 > ceiling_r + 1e-9:
+        r3 = ceiling_r
+        r2 = min(r2, r3 - gap)
+        r1 = min(r1, r2 - gap)
+    if not (0 < r1 < r2 < r3) or r1 < cfg.tp1_min_r * 0.6:
+        decision.block(f"no_reachable_target_ladder(ceiling {ceiling_r:.1f}R)")
+        return None
 
-    # keep them ordered and separated even after substitutions
-    ordered_tps = sorted([tp1, tp2, tp3], reverse=not long_)
-    tp1, tp2, tp3 = ordered_tps
-    if long_ and not (tp1 < tp2 < tp3):
-        tp2 = max(tp2, tp1 + 0.35 * risk)
-        tp3 = max(tp3, tp2 + 0.35 * risk)
-    if not long_ and not (tp1 > tp2 > tp3):
-        tp2 = min(tp2, tp1 - 0.35 * risk)
-        tp3 = min(tp3, tp2 - 0.35 * risk)
+    tp1 = entry_ref + sign * r1 * risk
+    tp2 = entry_ref + sign * r2 * risk
+    tp3 = entry_ref + sign * r3 * risk
 
     rr = abs(tp3 - entry_ref) / risk
     if rr < cfg.min_rr_after_cap:
@@ -147,8 +200,11 @@ def build_signal(ctx, decision: Decision, cfg,
         decision.block("level_ordering_invalid")
         return None
 
-    target_meta = [{"price": c["price"], "source": c["source"], "label": c.get("label", ""),
-                    "r": round(c["r"], 2)} for c in chosen if c]
+    target_meta = []
+    for level, pick in zip((tp1, tp2, tp3), chosen):
+        if pick and abs(float(pick["price"]) - level) / entry_ref < 1e-9:
+            target_meta.append({"price": level, "source": pick["source"],
+                                "label": pick.get("label", ""), "r": round(pick["r"], 2)})
 
     return Signal(
         symbol=ctx.symbol, direction=direction,
@@ -160,6 +216,9 @@ def build_signal(ctx, decision: Decision, cfg,
         risk_pct=risk_pct, rr=rr, decimals=ctx.decimals, created_ts=now_ms(),
         meta={
             "exchange": ctx.exchange,
+            "trend": decision.details.get("trend_state"),
+            "counter_trend": decision.details.get("trend_conflict") in ("soft", "hard"),
+            "reach_cap": reach,
             "sweep_level": level,
             "sweep_extreme": extreme,
             "sweep_age_bars": age,

@@ -79,15 +79,19 @@ class Settings:
     blacklist: str = field(default_factory=lambda: _s("SYMBOL_BLACKLIST", ""))
     require_history_listing: bool = field(
         default_factory=lambda: _b("REQUIRE_HISTORY_LISTING", True))
-    # Tokenised metals, equities and pre-IPO products. They are quoted in USDT
-    # and pass every volume filter, but they track an underlying this engine
-    # cannot see, and their books are far too thin for footprint work.
-    # Extend this list as venues add more of them.
+    # Tokenised EQUITIES, indices and pre-IPO products. These track an
+    # underlying this engine cannot see and trade on exchange-hours rhythms
+    # that make their order flow unreadable overnight.
+    #
+    # Tokenised METALS (XAUT, PAXG, XAG) are deliberately NOT excluded: they
+    # trade continuously against crypto liquidity, and the volume filter
+    # already removes any that are too thin to read. Add them back here if you
+    # do not want them.
     exclude_underlyings: str = field(default_factory=lambda: _s(
         "EXCLUDE_UNDERLYINGS",
-        "XAU,XAG,XAUT,PAXG,XPT,XPD,WTI,OIL,BRENT,SPX,SPX500,NDX,NAS100,DJI,US30,"
-        "DAX,NIKKEI,SPCX,OPENAI,MRVL,NVDA,TSLA,AAPL,MSFT,META,AMZN,GOOGL,GOOG,"
-        "NFLX,AMD,INTC,COIN,HOOD,MSTR,PLTR,GME,AMC,BABA,IBIT,CRCL"))
+        "SPX,SPX500,NDX,NAS100,DJI,US30,DAX,NIKKEI,SPCX,OPENAI,MRVL,NVDA,TSLA,"
+        "AAPL,MSFT,META,AMZN,GOOGL,GOOG,NFLX,AMD,INTC,COIN,HOOD,MSTR,PLTR,GME,"
+        "AMC,BABA,IBIT,CRCL"))
 
     # ---------------------------------------------------------------- candles
     htf_interval: str = field(default_factory=lambda: _s("HTF_INTERVAL", "4h"))
@@ -194,14 +198,22 @@ class Settings:
     sl_buffer_pct_min: float = field(default_factory=lambda: _f("SL_BUFFER_PCT_MIN", 0.0010))
     entry_pad_atr: float = field(default_factory=lambda: _f("ENTRY_PAD_ATR", 0.12))
     tp1_r: float = field(default_factory=lambda: _f("TP1_R", 1.0))
-    tp1_min_r: float = field(default_factory=lambda: _f("TP1_MIN_R", 0.85))
-    tp2_min_r: float = field(default_factory=lambda: _f("TP2_MIN_R", 1.70))
-    tp3_min_r: float = field(default_factory=lambda: _f("TP3_MIN_R", 2.80))
+    # Reward WINDOWS, not just floors. TP1 must be close enough to be reached -
+    # it is what buys the breakeven stop - and TP3 must stay inside what recent
+    # volatility can actually deliver.
+    tp1_min_r: float = field(default_factory=lambda: _f("TP1_MIN_R", 0.80))
+    tp1_max_r: float = field(default_factory=lambda: _f("TP1_MAX_R", 1.60))
+    tp2_min_r: float = field(default_factory=lambda: _f("TP2_MIN_R", 1.60))
+    tp2_max_r: float = field(default_factory=lambda: _f("TP2_MAX_R", 3.20))
+    tp3_min_r: float = field(default_factory=lambda: _f("TP3_MIN_R", 2.50))
+    tp3_max_r: float = field(default_factory=lambda: _f("TP3_MAX_R", 6.00))
+    tp_reach_atr_mult: float = field(default_factory=lambda: _f("TP_REACH_ATR_MULT", 1.6))
+    tp_min_separation_r: float = field(default_factory=lambda: _f("TP_MIN_SEPARATION_R", 0.40))
     sl_zone_edge_atr: float = field(default_factory=lambda: _f("SL_ZONE_EDGE_ATR", 1.2))
     tp2_r: float = field(default_factory=lambda: _f("TP2_R", 2.0))
     tp3_r: float = field(default_factory=lambda: _f("TP3_R", 3.5))
     min_risk_pct: float = field(default_factory=lambda: _f("MIN_RISK_PCT", 0.0018))
-    max_risk_pct: float = field(default_factory=lambda: _f("MAX_RISK_PCT", 0.045))
+    max_risk_pct: float = field(default_factory=lambda: _f("MAX_RISK_PCT", 0.035))
     structural_tp_cap: bool = field(default_factory=lambda: _b("STRUCTURAL_TP_CAP", True))
     min_rr_after_cap: float = field(default_factory=lambda: _f("MIN_RR_AFTER_CAP", 2.0))
 
@@ -211,6 +223,15 @@ class Settings:
     trail_to_tp1_after_tp2: bool = field(default_factory=lambda: _b("TRAIL_TO_TP1_AFTER_TP2", True))
     trade_ttl_hours: float = field(default_factory=lambda: _f("TRADE_TTL_HOURS", 48))
     monitor_tick_sec: int = field(default_factory=lambda: _i("MONITOR_TICK_SEC", 2))
+
+    # ------------------------------------------------------------- schedule
+    # Thin weekend books produce sweeps that do not follow through. The engine
+    # stops hunting for the weekend and wakes on Monday morning, local time.
+    # Open setups are still monitored to completion while it sleeps.
+    weekend_sleep: bool = field(default_factory=lambda: _b("WEEKEND_SLEEP", True))
+    sleep_days: str = field(default_factory=lambda: _s("SLEEP_DAYS", "5,6"))  # Mon=0
+    wake_hour: int = field(default_factory=lambda: _i("WAKE_HOUR", 6))
+    tz_offset_hours: float = field(default_factory=lambda: _f("TZ_OFFSET_HOURS", 0.0))
 
     # ---------------------------------------------------------------- system
     db_path: str = field(default_factory=lambda: _s("DB_PATH", "data/sniper.db"))
@@ -235,6 +256,15 @@ class Settings:
     command_timeout_sec: int = field(default_factory=lambda: _i("COMMAND_TIMEOUT_SEC", 45))
 
     # ------------------------------------------------------------------ helpers
+    @property
+    def sleep_day_set(self) -> set:
+        out = set()
+        for part in self.sleep_days.split(","):
+            part = part.strip()
+            if part.isdigit() and 0 <= int(part) <= 6:
+                out.add(int(part))
+        return out
+
     @property
     def excluded_underlyings(self) -> set:
         return {s.strip().upper() for s in self.exclude_underlyings.split(",") if s.strip()}

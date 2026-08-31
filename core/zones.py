@@ -499,6 +499,10 @@ class ZoneEngine:
             if z.kind == "supply" and price > z.high:
                 continue
 
+            # carry the higher-timeframe volatility with the zone: it is the
+            # yardstick for how far price can travel in a session, and the
+            # risk model has no 4H candles of its own
+            z.flags["htf_atr"] = htf_ctx.atr
             z.flags["mtf_partner"] = next(
                 ((m.low, m.high) for m in mtf_zones if m.kind == z.kind and m.overlaps(z)), None)
             scored.append(z)

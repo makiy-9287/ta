@@ -426,7 +426,7 @@ async def _test_db(signal) -> bool:
 
     perf = await db.performance(0)
     ok &= check("performance report computed",
-                perf["closed"] == 1 and perf["total_r"] > 2.5,
+                perf["closed"] == 1 and perf["total_r"] >= SETTINGS.tp3_min_r * 0.9,
                 f"{perf['closed']} closed, {perf['total_r']:+.2f}R, winrate {perf['winrate']:.0f}%")
 
     # stop-loss path on a fresh row
@@ -844,6 +844,69 @@ def test_liquidity_gate(ctx) -> bool:
     return ok
 
 
+def test_targets_and_schedule(ctx, zone) -> bool:
+    """
+    Target sanity and the weekend schedule.
+
+    The 119R target was real: TP3 was offered at a price the market would have
+    had to nearly triple to reach, because a distant 4H zone cleared the
+    minimum reward and nothing capped the maximum.
+    """
+    from datetime import datetime, timezone
+
+    from core.engine import SniperEngine
+
+    decision = evaluate(ctx, SETTINGS, "range")
+    # a wildly distant "opposing zone", exactly as the live signal had
+    absurd = ctx.price * 3.0
+    signal = build_signal(ctx, decision, SETTINGS, opposing_level=absurd)
+    ok = check("a target three times the price is not offered", signal is not None
+               and signal.tp3 < ctx.price * 1.5,
+               f"TP3 {signal.tp3:.2f} vs the {absurd:.2f} zone that was offered")
+
+    risk = abs(signal.entry_ref - signal.sl)
+    r = [abs(t - signal.entry_ref) / risk for t in (signal.tp1, signal.tp2, signal.tp3)]
+    ok &= check("targets are ordered and separated",
+                r[0] < r[1] < r[2] and (r[1] - r[0]) >= SETTINGS.tp_min_separation_r * 0.99,
+                f"{r[0]:.2f}R / {r[1]:.2f}R / {r[2]:.2f}R")
+    ok &= check("TP1 stays close enough to be reachable",
+                SETTINGS.tp1_min_r * 0.95 <= r[0] <= SETTINGS.tp1_max_r * 1.05,
+                f"TP1 {r[0]:.2f}R (window {SETTINGS.tp1_min_r}-{SETTINGS.tp1_max_r}R)")
+    ok &= check("TP3 stays inside the volatility reach",
+                abs(signal.tp3 - signal.entry_ref) <= float(signal.meta["reach_cap"]) * 1.01,
+                f"{abs(signal.tp3 - signal.entry_ref) / float(signal.meta['reach_cap']) * 100:.0f}% "
+                f"of reach")
+
+    engine = SniperEngine(SETTINGS)
+    cases = [("Friday 23:00", datetime(2026, 8, 28, 23, 0, tzinfo=timezone.utc), False),
+             ("Saturday 10:00", datetime(2026, 8, 29, 10, 0, tzinfo=timezone.utc), True),
+             ("Sunday 20:00", datetime(2026, 8, 30, 20, 0, tzinfo=timezone.utc), True),
+             ("Monday 05:30", datetime(2026, 8, 31, 5, 30, tzinfo=timezone.utc), True),
+             ("Monday 06:30", datetime(2026, 8, 31, 6, 30, tzinfo=timezone.utc), False)]
+    results = []
+    for _, when, expected in cases:
+        engine.local_now = lambda d=when: d
+        results.append(engine.sleep_state()[0] == expected)
+    ok &= check("engine sleeps Saturday and Sunday, wakes Monday morning",
+                all(results), f"{sum(results)}/{len(cases)} times correct")
+
+    engine.local_now = lambda: datetime(2026, 8, 31, 5, 30, tzinfo=timezone.utc)
+    ok &= check("wake time is the coming morning, not the next one",
+                engine.next_wake().strftime("%a %H:%M") == "Mon 06:00",
+                engine.next_wake().strftime("%a %H:%M"))
+
+    # metals are tradable again; tokenised equities are not
+    from core.watchlist import WatchlistManager
+    w = WatchlistManager({}, None, SETTINGS)
+    w.listings = {SETTINGS.history_exchange: {"XAUTUSDT", "PAXGUSDT", "XAGUSDT",
+                                              "MRVLUSDT", "SPCXUSDT"}}
+    ok &= check("tokenised gold and silver are tradable",
+                not any(w._acceptable(s) for s in ("XAUTUSDT", "PAXGUSDT", "XAGUSDT")))
+    ok &= check("tokenised equities are still excluded",
+                all(w._acceptable(s) for s in ("MRVLUSDT", "SPCXUSDT")))
+    return ok
+
+
 def test_universe() -> bool:
     """Junk listings must never reach the strategy."""
     from core.watchlist import WatchlistManager
@@ -1007,10 +1070,13 @@ def run_selftest() -> bool:
     print("\n\033[1m11. Universe filtering\033[0m")
     test_universe()
 
-    print("\n\033[1m12. Telegram rendering\033[0m")
+    print("\n\033[1m12. Targets and schedule\033[0m")
+    test_targets_and_schedule(ctx, zone)
+
+    print("\n\033[1m13. Telegram rendering\033[0m")
     test_formatting(signal)
 
-    print("\n\033[1m13. Resilience (rate limiter, dead feeds, hung commands)\033[0m")
+    print("\n\033[1m14. Resilience (rate limiter, dead feeds, hung commands)\033[0m")
     asyncio.run(_test_resilience(zone))
 
     return _summary()

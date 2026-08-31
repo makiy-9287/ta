@@ -258,6 +258,7 @@ def evaluate(ctx, cfg, trend_state: str = "range") -> Decision:
 
     conflict = _trend_conflict(direction, trend_state)
     d.details["trend_conflict"] = conflict
+    d.details["trend_state"] = trend_state
     if cfg.respect_htf_trend and conflict == "hard":
         d.block("against_4h_trend")
     elif conflict == "soft" and cfg.counter_trend_policy != "allow":

@@ -128,7 +128,9 @@ def close_alert(trade: dict, status: str, info: dict) -> str:
 def status_message(engine: dict, trades: List[dict]) -> str:
     lines = [
         "📊 <b>ENGINE STATUS</b>",
-        f"Uptime <b>{engine['uptime']}</b> · {'🟢 hunting' if not engine['paused'] else '⏸ paused'}",
+        f"Uptime <b>{engine['uptime']}</b> · "
+        + ("😴 asleep until " + esc(engine.get("next_wake", "")) if engine.get("asleep")
+           else ("⏸ paused" if engine["paused"] else "🟢 hunting")),
         f"Watchlist <b>{engine['watchlist']}</b> · Zones <b>{engine['zones']}</b> "
         f"(A+ {engine['a_plus']}) · Armed <b>{engine['armed']}</b>",
         "Feeds: " + " · ".join(f"{esc(k)} {v}" for k, v in
@@ -258,7 +260,23 @@ def report_message(perf: dict, period: str, breakdown: List[dict], engine: dict)
     grades: Dict[str, List[float]] = {}
     for r in perf["rows"]:
         grades.setdefault(r.get("grade") or "?", []).append(r.get("result_r") or 0.0)
-    extra = ["", "<b>By zone grade</b>"]
+    contexts: Dict[str, List[float]] = {}
+    for r in perf["rows"]:
+        try:
+            meta = json.loads(r.get("meta") or "{}")
+        except ValueError:
+            meta = {}
+        key = "counter-trend" if meta.get("counter_trend") else "with-trend"
+        contexts.setdefault(key, []).append(r.get("result_r") or 0.0)
+
+    extra = []
+    if len(contexts) > 1 or contexts:
+        extra += ["", "<b>By trend context</b>"]
+        for name, vals in sorted(contexts.items()):
+            wins = len([v for v in vals if v > 0])
+            extra.append(f"{name:<14} {len(vals)}x · {sum(vals):+.2f}R · {wins}/{len(vals)} won")
+
+    extra += ["", "<b>By zone grade</b>"]
     for g, vals in sorted(grades.items()):
         wins = len([v for v in vals if v > 0])
         extra.append(f"{g:<3} {len(vals)}x · {sum(vals):+.2f}R · {wins}/{len(vals)} won")
@@ -396,6 +414,26 @@ def why_message(ctx, decision, trend: str) -> str:
         for r in decision.reasons[:6]:
             lines.append(f"✔️ {esc(r)}")
     return "\n".join(lines)
+
+
+def sleep_message(reason: str, wake, open_trades: int) -> str:
+    return "\n".join([
+        "😴 <b>WEEKEND SLEEP</b>",
+        f"No new setups will be hunted ({esc(reason)}) — weekend books are thin "
+        f"and their sweeps rarely follow through.",
+        f"Waking <b>{wake.strftime('%A %H:%M')}</b> local time.",
+        (f"{open_trades} open setup(s) stay monitored to completion."
+         if open_trades else "No open setups."),
+    ])
+
+
+def wake_message(engine: dict) -> str:
+    return "\n".join([
+        "☀️ <b>AWAKE — HUNTING RESUMED</b>",
+        f"Watchlist <b>{engine['watchlist']}</b> · zones <b>{engine['zones']}</b> "
+        f"(A+ {engine['a_plus']})",
+        "Scanning for setups again.",
+    ])
 
 
 def help_message() -> str:

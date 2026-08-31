@@ -21,6 +21,7 @@ import json
 import os
 import time
 from collections import Counter
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
 
 from config import Settings
@@ -102,6 +103,7 @@ class SniperEngine:
         self._stop = asyncio.Event()
 
         self.paused = False
+        self.asleep = False
         self.started_at = time.time()
         self.cycles = 0
         self.evaluations = 0
@@ -153,6 +155,7 @@ class SniperEngine:
             asyncio.create_task(self._loop_monitor(), name="monitor"),
             asyncio.create_task(self._loop_flow_fallback(), name="flow-fallback"),
             asyncio.create_task(self._loop_prices(), name="prices"),
+            asyncio.create_task(self._loop_schedule(), name="schedule"),
             asyncio.create_task(self._loop_housekeeping(), name="housekeeping"),
             asyncio.create_task(self.bot.poll(self.handle_command), name="telegram"),
         ]
@@ -462,7 +465,7 @@ class SniperEngine:
         return self.prices.as_dict()
 
     async def _scan_proximity(self) -> None:
-        if self.paused:
+        if self.paused or self.asleep:
             return
         prices = await self._prices()
         if not prices:
@@ -622,6 +625,66 @@ class SniperEngine:
             return False
         return True
 
+    # ================================================================ schedule
+    def local_now(self) -> datetime:
+        return datetime.now(timezone.utc) + timedelta(hours=self.cfg.tz_offset_hours)
+
+    def sleep_state(self) -> tuple:
+        """
+        (asleep, human reason). Weekend books are thin and their sweeps rarely
+        follow through, so the engine stops hunting and wakes on the first
+        working morning. Open setups are still monitored while it sleeps.
+        """
+        cfg = self.cfg
+        if not cfg.weekend_sleep:
+            return False, ""
+        days = cfg.sleep_day_set
+        if not days:
+            return False, ""
+        now = self.local_now()
+        weekday = now.weekday()
+        if weekday in days:
+            return True, now.strftime("%A")
+        if ((weekday - 1) % 7) in days and now.hour < cfg.wake_hour:
+            return True, f"{now.strftime('%A')} before {cfg.wake_hour:02d}:00"
+        return False, ""
+
+    def next_wake(self) -> datetime:
+        """Next working morning - today's, if it has not passed yet."""
+        now = self.local_now()
+        probe = now.replace(hour=self.cfg.wake_hour, minute=0, second=0, microsecond=0)
+        for _ in range(10):
+            if probe > now and probe.weekday() not in self.cfg.sleep_day_set:
+                return probe
+            probe += timedelta(days=1)
+        return probe
+
+    async def _loop_schedule(self) -> None:
+        asleep, _ = self.sleep_state()
+        self.asleep = asleep
+        while not self._stop.is_set():
+            await asyncio.sleep(30)
+            try:
+                now_asleep, reason = self.sleep_state()
+                if now_asleep == self.asleep:
+                    continue
+                self.asleep = now_asleep
+                if now_asleep:
+                    for sym in list(self.armed):
+                        await self._disarm(sym, "weekend sleep")
+                    wake = self.next_wake()
+                    log.info("sleeping for the weekend (%s) - waking %s",
+                             reason, wake.strftime("%A %H:%M"))
+                    await self.bot.send(fmt.sleep_message(reason, wake,
+                                                          self.monitor.count))
+                else:
+                    log.info("waking up - resuming the hunt")
+                    await self.bot.send(fmt.wake_message(self._engine_stats()))
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                log.exception("schedule loop error: %s", exc)
+
     def _ws_usable(self) -> bool:
         """Has any websocket transport shown a sign of life?"""
         if self.bus.stats.pushed > 0:
@@ -687,7 +750,7 @@ class SniperEngine:
             self.cooldown[symbol] = time.time() + penalty
             return
 
-        if self.paused or self.monitor.count >= self.cfg.max_active_trades:
+        if self.paused or self.asleep or self.monitor.count >= self.cfg.max_active_trades:
             return
 
         ctx.evaluations += 1
@@ -806,6 +869,9 @@ class SniperEngine:
         return {
             "uptime": human_delta(time.time() - self.started_at),
             "paused": self.paused,
+            "asleep": self.asleep,
+            "sleep_reason": self.sleep_state()[1],
+            "next_wake": self.next_wake().strftime("%a %H:%M") if self.asleep else "",
             "watchlist": len(self.watchlist.symbols),
             "zones": len(zones),
             "a_plus": len([z for z in zones if z.grade == "A+"]),
