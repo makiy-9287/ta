@@ -69,8 +69,8 @@ def build_signal(ctx, decision: Decision, cfg,
     long_ = direction == "LONG"
     price = ctx.price
     sweep = decision.details.get("sweep") or {}
-    fast = ctx.candles.get(cfg.ltf_fast) or []
-    slow = ctx.candles.get(cfg.ltf_slow) or []
+    fast = ctx.closed_candles(cfg.ltf_fast)
+    slow = ctx.closed_candles(cfg.ltf_slow)
     a = atr(fast, 14) or atr(slow, 14)
     if a <= 0 or price <= 0:
         return None
@@ -148,7 +148,7 @@ def build_signal(ctx, decision: Decision, cfg,
     # on genuinely absurd targets rather than rejecting ordinary setups.
     htf_atr = float(ctx.zone.flags.get("htf_atr") or 0.0)
     if htf_atr <= 0:
-        mid = ctx.candles.get(cfg.ltf_mid) or []
+        mid = ctx.closed_candles(cfg.ltf_mid)
         htf_atr = (atr(mid, 14) * 4.0) if len(mid) >= 20 else a * 8.0
     reach = max(htf_atr * cfg.tp_reach_atr_mult, cfg.tp3_min_r * risk * 1.15)
     ceiling_r = min(cfg.tp3_max_r, reach / risk)

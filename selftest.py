@@ -32,8 +32,9 @@ from core.heatmap import LiquidityHeatmap
 from core.liquidity import LiquidityMap
 from core.database import Database
 from core.indicators import atr, cvd_divergence, htf_trend
-from core.models import Candle
+from core.models import Candle, Signal, Zone
 from core.monitor import TradeMonitor
+from core.utils import now_ms
 from core.risk import build_signal
 from core.structure import detect_mss, detect_sweep
 from core.utils import get_logger
@@ -425,9 +426,22 @@ async def _test_db(signal) -> bool:
     ok &= check("symbol released back to the watchlist pool", signal.symbol in released)
 
     perf = await db.performance(0)
-    ok &= check("performance report computed",
-                perf["closed"] == 1 and perf["total_r"] >= SETTINGS.tp3_min_r * 0.9,
-                f"{perf['closed']} closed, {perf['total_r']:+.2f}R, winrate {perf['winrate']:.0f}%")
+    f1, f2, f3 = TradeMonitor._fractions(SETTINGS)
+    risk = abs(signal.entry_ref - signal.sl)
+    expected = sum(f * abs(tp - signal.entry_ref) / risk
+                   for f, tp in ((f1, signal.tp1), (f2, signal.tp2), (f3, signal.tp3)))
+    ok &= check("scaled exits are accounted correctly",
+                perf["closed"] == 1 and abs(perf["total_r"] - expected) < 0.05,
+                f"{perf['total_r']:+.2f}R vs {expected:+.2f}R expected from "
+                f"{int(f1*100)}/{int(f2*100)}/{int(f3*100)} scaling")
+
+    # the failure that produced six zeros: TP1 reached, remainder stopped at entry
+    monitor.cfg = SETTINGS
+    partial = dict(entry_ref=100.0, sl=99.0, direction="LONG",
+                   tp1=101.2, tp2=102.0, tp3=103.5, tp1_ts=1)
+    banked = monitor._realised_r(partial, 100.0)
+    ok &= check("reaching TP1 is worth something even if the runner breaks even",
+                banked > 0.3, f"{banked:+.2f}R instead of +0.00R")
 
     # stop-loss path on a fresh row
     signal.symbol = "LOSSUSDT"
@@ -907,6 +921,73 @@ def test_targets_and_schedule(ctx, zone) -> bool:
     return ok
 
 
+async def _test_risk_controls(zone) -> bool:
+    """
+    The controls that were missing while a live run lost 4.5R across 18 signals:
+    a zone that keeps stopping setups out, a symbol on a losing streak, and no
+    brake on the whole thing.
+    """
+    import os
+    import tempfile
+
+    from core.engine import SniperEngine
+
+    original_db = SETTINGS.db_path
+    SETTINGS.db_path = os.path.join(tempfile.mkdtemp(prefix="sniper-risk-"), "r.db")
+    engine = SniperEngine(SETTINGS)
+    await engine.db.init()
+    try:
+        # a zone that just stopped a setup out must not be re-armed
+        engine._note_zone_failure("BLESSUSDT", zone.low, zone.high)
+        overlapping = Zone(symbol="BLESSUSDT", kind=zone.kind, tf="4h",
+                           low=zone.low + zone.height * 0.1,
+                           high=zone.high + zone.height * 0.1)
+        elsewhere = Zone(symbol="BLESSUSDT", kind=zone.kind, tf="4h",
+                         low=zone.high + zone.height * 3,
+                         high=zone.high + zone.height * 4)
+        ok = check("a zone that stopped a setup out is not traded again",
+                   engine._zone_failed("BLESSUSDT", overlapping)
+                   and not engine._zone_failed("BLESSUSDT", elsewhere))
+
+        # consecutive losses on one symbol buy an escalating rest
+        trade = {"symbol": "BLESSUSDT", "direction": "LONG", "zone_low": zone.low,
+                 "zone_high": zone.high, "result_r": -1.0, "id": 1, "decimals": 2,
+                 "entry_ref": zone.mid, "sl": zone.low, "created_ts": now_ms(),
+                 "tp1": 0, "tp2": 0, "tp3": 0}
+        engine.bot = _NullBot()
+        cooldowns = []
+        for _ in range(3):
+            await engine._trade_event(trade, "LOSS", {"price": zone.low, "r": -1.0})
+            cooldowns.append(engine.cooldown["BLESSUSDT"] - time.time())
+        ok &= check("each consecutive loss on a symbol buys a longer rest",
+                    cooldowns[0] < cooldowns[1] < cooldowns[2],
+                    " -> ".join(f"{c/60:.0f}m" for c in cooldowns))
+
+        # and the drawdown brake halts hunting entirely
+        for i in range(6):
+            sig = Signal(symbol=f"S{i}USDT", direction="LONG", entry_low=1, entry_high=1.01,
+                         entry_ref=1.0, sl=0.99, tp1=1.02, tp2=1.03, tp3=1.04,
+                         grade="A", zone_score=75, confidence=0.7, created_ts=now_ms())
+            sid = await engine.db.insert_signal(sig)
+            await engine.db.update_signal(sid, status="LOSS", closed_ts=now_ms(),
+                                          result_r=-1.0, close_price=0.99)
+        await engine._check_circuit_breaker()
+        ok &= check("a losing run trips the circuit breaker",
+                    engine.breaker_until > time.time(),
+                    f"halted for {int((engine.breaker_until - time.time())/60)} minutes")
+    finally:
+        SETTINGS.db_path = original_db
+        await engine.db.close()
+    return ok
+
+
+class _NullBot:
+    sent = 0
+
+    async def send(self, text, **kw):
+        return None
+
+
 def test_universe() -> bool:
     """Junk listings must never reach the strategy."""
     from core.watchlist import WatchlistManager
@@ -1070,13 +1151,16 @@ def run_selftest() -> bool:
     print("\n\033[1m11. Universe filtering\033[0m")
     test_universe()
 
-    print("\n\033[1m12. Targets and schedule\033[0m")
+    print("\n\033[1m12. Risk controls\033[0m")
+    asyncio.run(_test_risk_controls(zone))
+
+    print("\n\033[1m13. Targets and schedule\033[0m")
     test_targets_and_schedule(ctx, zone)
 
-    print("\n\033[1m13. Telegram rendering\033[0m")
+    print("\n\033[1m14. Telegram rendering\033[0m")
     test_formatting(signal)
 
-    print("\n\033[1m14. Resilience (rate limiter, dead feeds, hung commands)\033[0m")
+    print("\n\033[1m15. Resilience (rate limiter, dead feeds, hung commands)\033[0m")
     asyncio.run(_test_resilience(zone))
 
     return _summary()

@@ -23,6 +23,41 @@ Released = Callable[[str], Awaitable[None]]
 
 
 class TradeMonitor:
+    @staticmethod
+    def _fractions(cfg) -> tuple:
+        f1 = max(0.0, min(1.0, cfg.tp1_fraction))
+        f2 = max(0.0, min(1.0 - f1, cfg.tp2_fraction))
+        return f1, f2, max(0.0, 1.0 - f1 - f2)
+
+    def _realised_r(self, trade: dict, exit_price: float) -> float:
+        """
+        Result in R with scaled exits.
+
+        Treating a setup as all-or-nothing is what turned eight TP1 hits into
+        six zeros: price reached the first target, the stop moved to entry, and
+        the whole position gave it back. Booking a share of the position at
+        each target reflects how the setup is actually traded, so reaching TP1
+        is worth something even when the remainder stops at breakeven.
+        """
+        entry = trade["entry_ref"]
+        risk = abs(entry - trade["sl"]) or 1e-9
+        long_ = trade["direction"] == "LONG"
+        f1, f2, f3 = self._fractions(self.cfg)
+
+        def r_of(price: float) -> float:
+            return ((price - entry) if long_ else (entry - price)) / risk
+
+        realised = 0.0
+        remaining = 1.0
+        for frac, key, stamp in ((f1, "tp1", "tp1_ts"), (f2, "tp2", "tp2_ts"),
+                                 (f3, "tp3", "tp3_ts")):
+            if trade.get(stamp) and frac > 0:
+                realised += frac * r_of(trade[key])
+                remaining -= frac
+        if remaining > 1e-9:
+            realised += remaining * r_of(exit_price)
+        return realised
+
     def __init__(self, db, cfg, notify: Notify, on_release: Optional[Released] = None):
         self.db = db
         self.cfg = cfg
@@ -93,14 +128,16 @@ class TradeMonitor:
         # ---------------------------------------------------------- stop hit
         if (long_ and price <= stop) or (not long_ and price >= stop):
             r = ((stop - entry) if long_ else (entry - stop)) / risk
+            realised = self._realised_r(trade, stop)
             if trade.get("tp2_ts"):
                 status, reason = "WIN", "Trailed stop after TP2"
             elif trade.get("tp1_ts"):
-                status, reason = ("BREAKEVEN", "Stopped at breakeven after TP1") if abs(r) < 0.15 \
-                    else (("WIN" if r > 0 else "LOSS"), "Stop after TP1")
+                status = "WIN" if realised > 0.05 else ("LOSS" if realised < -0.05 else "BREAKEVEN")
+                reason = "Remainder stopped at breakeven after TP1" if abs(r) < 0.15 \
+                    else "Stop after TP1"
             else:
                 status, reason = "LOSS", "Stop loss hit"
-            await self._close(trade, stop, status, reason, r)
+            await self._close(trade, stop, status, reason, realised)
             return
 
         # ------------------------------------------------------------ targets
@@ -117,9 +154,10 @@ class TradeMonitor:
             updates = {hit_field: trade[hit_field], "status": f"TP{n}"}
 
             if n == 3:
-                r = ((target - entry) if long_ else (entry - target)) / risk
                 await self.db.update_signal(tid, **{hit_field: trade[hit_field]})
-                await self._close(trade, target, "WIN", "TP3 reached - setup complete", r)
+                realised = self._realised_r(trade, target)
+                await self._close(trade, target, "WIN",
+                                  "TP3 reached - setup complete", realised)
                 return
 
             if n == 1 and self.cfg.breakeven_after_tp1:
@@ -132,16 +170,19 @@ class TradeMonitor:
             trade["status"] = f"TP{n}"
             await self.db.update_signal(tid, **updates)
             await self.db.add_event(tid, f"TP{n}", price, "")
-            await self._notify_safe(trade, f"TP{n}", {"price": price, "r": r_now,
-                                                      "new_stop": trade.get("sl_current")})
+            f1, f2, f3 = self._fractions(self.cfg)
+            booked = (f1, f2, f3)[n - 1]
+            await self._notify_safe(trade, f"TP{n}", {
+                "price": price, "r": r_now, "new_stop": trade.get("sl_current"),
+                "booked": booked, "locked_r": self._realised_r(trade, price)})
             log.info("%s #%d hit TP%d at %s", trade["symbol"], tid, n, fmt_price(price, trade["decimals"]))
             break
 
         # ------------------------------------------------------------ expiry
         age_h = (now_ms() - (trade["created_ts"] or now_ms())) / 3_600_000
         if age_h >= self.cfg.trade_ttl_hours and not trade.get("tp1_ts"):
-            r = ((price - entry) if long_ else (entry - price)) / risk
-            await self._close(trade, price, "EXPIRED", f"No progress in {int(age_h)}h", r)
+            await self._close(trade, price, "EXPIRED", f"No progress in {int(age_h)}h",
+                              self._realised_r(trade, price))
 
     # ------------------------------------------------------------------ close
     async def _close(self, trade: dict, price: float, status: str, reason: str, r: float) -> None:
@@ -168,7 +209,7 @@ class TradeMonitor:
             return False
         entry = trade["entry_ref"]
         risk = abs(entry - trade["sl"]) or 1e-9
-        r = ((price - entry) if trade["direction"] == "LONG" else (entry - price)) / risk
+        r = self._realised_r(trade, price)
         status = "WIN" if r > 0.05 else ("LOSS" if r < -0.05 else "BREAKEVEN")
         await self._close(trade, price, status, reason, r)
         return True

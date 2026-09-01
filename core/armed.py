@@ -224,7 +224,7 @@ class ArmedContext:
         # one map per timeframe: whatever finds a sweep must be matched against
         # structure from the same candles, or the levels never line up
         for interval in (self.cfg.ltf_fast, self.cfg.ltf_slow, self.cfg.ltf_mid):
-            series = self.candles.get(interval) or []
+            series = self.closed_candles(interval)
             if len(series) >= 40:
                 self._liq_maps[interval] = LiquidityMap(
                     series, left=2, right=2, equal_tol_atr=self.cfg.equal_level_atr_tol)
@@ -241,6 +241,23 @@ class ArmedContext:
         if micro:
             self.vwap = vwap_context(micro, self.price, self.direction,
                                      lookback=self.cfg.vwap_lookback)
+
+    def closed_candles(self, interval: str) -> List[Candle]:
+        """
+        Candles that have actually finished.
+
+        Structure must be confirmed on closed bars. A 3m candle thirty seconds
+        old can be above a level and back under it before it prints - reading
+        the forming bar means the reclaim and the structure shift can both
+        evaporate seconds after the signal fires, which is what a cluster of
+        stop-outs inside twenty minutes looks like.
+        """
+        series = self.candles.get(interval) or []
+        if not self.cfg.require_closed_candles:
+            return series
+        if series and series[-1].close_ts and series[-1].close_ts > now_ms():
+            return series[:-1]
+        return series
 
     def liquidity_for(self, interval: str) -> Optional[LiquidityMap]:
         """Structural map built from a specific timeframe's candles."""

@@ -62,10 +62,12 @@ def evaluate(ctx, cfg, trend_state: str = "range") -> Decision:
 
     ctx.refresh_derived()
 
-    micro = ctx.candles.get(cfg.micro_interval) or []
-    fast = ctx.candles.get(cfg.ltf_fast) or []
-    slow = ctx.candles.get(cfg.ltf_slow) or []
-    mid = ctx.candles.get(cfg.ltf_mid) or []
+    # structure is judged on CLOSED bars only; live price is used separately
+    # for the entry window and the risk model
+    micro = ctx.closed_candles(cfg.micro_interval)
+    fast = ctx.closed_candles(cfg.ltf_fast)
+    slow = ctx.closed_candles(cfg.ltf_slow)
+    mid = ctx.closed_candles(cfg.ltf_mid)
 
     # ------------------------------------------------------------- data gates
     health = book.health(cfg.min_trades_for_flow)

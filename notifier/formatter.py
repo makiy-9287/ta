@@ -95,9 +95,13 @@ def tp_alert(trade: dict, level: str, info: dict) -> str:
         f"{STATUS_ICON.get(level, '✅')} <b>{level} HIT</b> · {esc(trade['symbol'])} {trade['direction']} <code>#{trade['id']}</code>",
         f"Price <code>{_p(price, d)}</code>  ({info.get('r', 0):+.2f}R)",
     ]
+    booked = info.get("booked")
+    if booked:
+        lines.append(f"💰 Booked <b>{int(booked*100)}%</b> here · "
+                     f"locked <b>{info.get('locked_r', 0):+.2f}R</b> so far")
     if new_stop:
         note = "breakeven" if level == "TP1" else "TP1"
-        lines.append(f"🔒 Stop moved to {note}: <code>{_p(new_stop, d)}</code>")
+        lines.append(f"🔒 Runner stop moved to {note}: <code>{_p(new_stop, d)}</code>")
     if level != "TP3":
         lines.append("Setup still running.")
     return "\n".join(lines)
@@ -129,7 +133,8 @@ def status_message(engine: dict, trades: List[dict]) -> str:
     lines = [
         "📊 <b>ENGINE STATUS</b>",
         f"Uptime <b>{engine['uptime']}</b> · "
-        + ("😴 asleep until " + esc(engine.get("next_wake", "")) if engine.get("asleep")
+        + (f"🛑 halted {engine['breaker']}m (drawdown)" if engine.get("breaker")
+           else "😴 asleep until " + esc(engine.get("next_wake", "")) if engine.get("asleep")
            else ("⏸ paused" if engine["paused"] else "🟢 hunting")),
         f"Watchlist <b>{engine['watchlist']}</b> · Zones <b>{engine['zones']}</b> "
         f"(A+ {engine['a_plus']}) · Armed <b>{engine['armed']}</b>",
@@ -433,6 +438,18 @@ def wake_message(engine: dict) -> str:
         f"Watchlist <b>{engine['watchlist']}</b> · zones <b>{engine['zones']}</b> "
         f"(A+ {engine['a_plus']})",
         "Scanning for setups again.",
+    ])
+
+
+def breaker_message(perf: dict, window_h: float, cooldown_h: float) -> str:
+    return "\n".join([
+        "🛑 <b>CIRCUIT BREAKER</b>",
+        f"<b>{perf['total_r']:+.2f}R</b> across {perf['closed']} closed setups in the "
+        f"last {int(window_h)}h.",
+        f"Signal generation paused for <b>{int(cooldown_h)}h</b>. Open setups are "
+        f"still monitored.",
+        "<i>Conditions are not suiting the model right now. Check /report before "
+        "resuming early with /resume.</i>",
     ])
 
 

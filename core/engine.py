@@ -93,6 +93,9 @@ class SniperEngine:
         self.venue_starved: Counter = Counter()     # contexts that got nothing
         self.venue_blocked_until: Dict[str, float] = {}
         self.starve_count: Counter = Counter()      # per symbol, for backoff
+        self.failed_zones: Dict[str, List[tuple]] = {}   # symbol -> (low, high, until)
+        self.loss_streak: Counter = Counter()       # consecutive losses per symbol
+        self.breaker_until = 0.0
         self._rest_price_ts = 0.0
         self._price_warn_ts = 0.0
         self.price_source = "starting"
@@ -465,7 +468,7 @@ class SniperEngine:
         return self.prices.as_dict()
 
     async def _scan_proximity(self) -> None:
-        if self.paused or self.asleep:
+        if self.paused or self.asleep or self.breaker_until > time.time():
             return
         prices = await self._prices()
         if not prices:
@@ -485,6 +488,9 @@ class SniperEngine:
                     continue
                 if not self._viable_under_trend(z, symbol):
                     self.blockers["skipped_unviable_vs_trend"] += 1
+                    continue
+                if self._zone_failed(symbol, z):
+                    self.blockers["zone_already_failed"] += 1
                     continue
                 candidates.append((z.score, symbol, z, price))
                 break
@@ -750,7 +756,8 @@ class SniperEngine:
             self.cooldown[symbol] = time.time() + penalty
             return
 
-        if self.paused or self.asleep or self.monitor.count >= self.cfg.max_active_trades:
+        if self.paused or self.asleep or self.breaker_until > time.time() \
+                or self.monitor.count >= self.cfg.max_active_trades:
             return
 
         ctx.evaluations += 1
@@ -851,9 +858,78 @@ class SniperEngine:
 
     # ============================================================ trade events
     async def _trade_event(self, trade: dict, kind: str, info: dict) -> None:
+        if kind not in ("TP1", "TP2"):
+            symbol = trade["symbol"]
+            if kind == "LOSS":
+                self.loss_streak[symbol] += 1
+                low, high = trade.get("zone_low") or 0.0, trade.get("zone_high") or 0.0
+                if low and high:
+                    self._note_zone_failure(symbol, low, high)
+                # each consecutive loss on a symbol buys a longer rest
+                streak = self.loss_streak[symbol]
+                extra = min(self.cfg.loss_backoff_max_minutes,
+                            self.cfg.rearm_cooldown_minutes * (2 ** min(streak, 4)))
+                self.cooldown[symbol] = time.time() + extra * 60
+                if streak >= self.cfg.max_symbol_loss_streak:
+                    log.warning("%s has lost %d in a row - resting it for %d minutes",
+                                symbol, streak, extra)
+            elif (trade.get("result_r") or 0) > 0.05:
+                self.loss_streak[symbol] = 0
+            await self._check_circuit_breaker()
+
         text = fmt.tp_alert(trade, kind, info) if kind in ("TP1", "TP2") \
             else fmt.close_alert(trade, kind, info)
         await self.bot.send(text)
+
+    async def _check_circuit_breaker(self) -> None:
+        """
+        Stop hunting after a bad run.
+
+        Without a brake the engine happily generated eighteen signals into a
+        losing sequence. A rolling drawdown limit forces a pause so conditions
+        can change before more risk is taken.
+        """
+        if self.cfg.max_drawdown_r <= 0 or self.breaker_until > time.time():
+            return
+        since = now_ms() - int(self.cfg.drawdown_window_hours * 3_600_000)
+        try:
+            perf = await self.db.performance(since)
+        except Exception:  # noqa: BLE001
+            return
+        if perf["closed"] < self.cfg.drawdown_min_trades:
+            return
+        if perf["total_r"] > -abs(self.cfg.max_drawdown_r):
+            return
+        self.breaker_until = time.time() + self.cfg.breaker_cooldown_hours * 3600
+        for sym in list(self.armed):
+            await self._disarm(sym, "circuit breaker")
+        log.warning("circuit breaker: %.2fR over %d trades in %sh - pausing for %sh",
+                    perf["total_r"], perf["closed"], self.cfg.drawdown_window_hours,
+                    self.cfg.breaker_cooldown_hours)
+        await self.bot.send(fmt.breaker_message(perf, self.cfg.drawdown_window_hours,
+                                                self.cfg.breaker_cooldown_hours))
+
+    def _note_zone_failure(self, symbol: str, low: float, high: float) -> None:
+        """
+        A zone that just stopped a setup out is not a zone any more.
+
+        Re-arming the same box minutes later is how one symbol produced three
+        full losses in six hours: the level had already failed, and every
+        subsequent sweep of it was continuation, not a reversal.
+        """
+        until = time.time() + self.cfg.zone_failure_minutes * 60
+        entries = [z for z in self.failed_zones.get(symbol, []) if z[2] > time.time()]
+        entries.append((low, high, until))
+        self.failed_zones[symbol] = entries[-6:]
+
+    def _zone_failed(self, symbol: str, zone: Zone) -> bool:
+        now = time.time()
+        for low, high, until in self.failed_zones.get(symbol, []):
+            if until <= now:
+                continue
+            if min(zone.high, high) >= max(zone.low, low):     # overlaps
+                return True
+        return False
 
     async def _release_symbol(self, symbol: str) -> None:
         """Setup finished - the coin goes back into the hunting pool."""
@@ -871,6 +947,7 @@ class SniperEngine:
             "paused": self.paused,
             "asleep": self.asleep,
             "sleep_reason": self.sleep_state()[1],
+            "breaker": max(0, int((self.breaker_until - time.time()) / 60)),
             "next_wake": self.next_wake().strftime("%a %H:%M") if self.asleep else "",
             "watchlist": len(self.watchlist.symbols),
             "zones": len(zones),

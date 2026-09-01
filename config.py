@@ -127,6 +127,15 @@ class Settings:
     arm_warmup_sec: int = field(default_factory=lambda: _i("ARM_WARMUP_SEC", 90))
     eval_interval_sec: int = field(default_factory=lambda: _i("EVAL_INTERVAL_SEC", 15))
     rearm_cooldown_minutes: int = field(default_factory=lambda: _i("REARM_COOLDOWN_MINUTES", 120))
+    # A zone that stopped a setup out has failed; do not trade it again today.
+    zone_failure_minutes: int = field(default_factory=lambda: _i("ZONE_FAILURE_MINUTES", 720))
+    max_symbol_loss_streak: int = field(default_factory=lambda: _i("MAX_SYMBOL_LOSS_STREAK", 2))
+    loss_backoff_max_minutes: int = field(default_factory=lambda: _i("LOSS_BACKOFF_MAX_MINUTES", 720))
+    # Rolling drawdown brake.
+    max_drawdown_r: float = field(default_factory=lambda: _f("MAX_DRAWDOWN_R", 4.0))
+    drawdown_window_hours: float = field(default_factory=lambda: _f("DRAWDOWN_WINDOW_HOURS", 24))
+    drawdown_min_trades: int = field(default_factory=lambda: _i("DRAWDOWN_MIN_TRADES", 5))
+    breaker_cooldown_hours: float = field(default_factory=lambda: _f("BREAKER_COOLDOWN_HOURS", 6))
 
     # ---------------------------------------------------------------- order flow
     ltf_fast: str = field(default_factory=lambda: _s("LTF_FAST", "3m"))
@@ -186,6 +195,7 @@ class Settings:
     sweep_fresh_bars: int = field(default_factory=lambda: _i("SWEEP_FRESH_BARS", 3))
     sweep_wick_bars: int = field(default_factory=lambda: _i("SWEEP_WICK_BARS", 3))
     require_structural_sweep: bool = field(default_factory=lambda: _b("REQUIRE_STRUCTURAL_SWEEP", True))
+    require_closed_candles: bool = field(default_factory=lambda: _b("REQUIRE_CLOSED_CANDLES", True))
     sweep_min_pierce_atr: float = field(default_factory=lambda: _f("SWEEP_MIN_PIERCE_ATR", 0.05))
     mss_lookback_bars: int = field(default_factory=lambda: _i("MSS_LOOKBACK_BARS", 40))
 
@@ -219,6 +229,10 @@ class Settings:
 
     # ---------------------------------------------------------------- trade monitor
     max_active_trades: int = field(default_factory=lambda: _i("MAX_ACTIVE_TRADES", 8))
+    # Scaled exits. A setup that reaches TP1 and then stops at breakeven should
+    # not be worth zero - part of it was already banked at the target.
+    tp1_fraction: float = field(default_factory=lambda: _f("TP1_FRACTION", 0.40))
+    tp2_fraction: float = field(default_factory=lambda: _f("TP2_FRACTION", 0.30))
     breakeven_after_tp1: bool = field(default_factory=lambda: _b("BREAKEVEN_AFTER_TP1", True))
     trail_to_tp1_after_tp2: bool = field(default_factory=lambda: _b("TRAIL_TO_TP1_AFTER_TP2", True))
     trade_ttl_hours: float = field(default_factory=lambda: _f("TRADE_TTL_HOURS", 48))
